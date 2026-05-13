@@ -1,1 +1,19 @@
-
+{
+  "name": "levels-engine-v1-4-backend-host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Express host for the v1.4 all-source overlap levels engine.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "openai": "^4.77.0",
+    "zod": "^3.25.76"
+  }
+}
