@@ -1,0 +1,2339 @@
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+
+// src/hyperliquid.ts
+var hyperliquid_exports = {};
+__export(hyperliquid_exports, {
+  INTERVAL_MS: () => INTERVAL_MS,
+  candlesToOhlcv: () => candlesToOhlcv,
+  fetchCandles: () => fetchCandles,
+  fetchL2Book: () => fetchL2Book,
+  fetchMetaAndCtxs: () => fetchMetaAndCtxs,
+  fetchTrades: () => fetchTrades,
+  intervalToLookbackMs: () => intervalToLookbackMs,
+  normalizeInterval: () => normalizeInterval,
+  normalizeSymbol: () => normalizeSymbol
+});
+var HL_API = "https://api.hyperliquid.xyz/info";
+var cache = /* @__PURE__ */ new Map();
+var inFlight = /* @__PURE__ */ new Map();
+var HL_TIMEOUT_MS = 12e3;
+async function cachedPost(key, ttlMs, body) {
+  const now = Date.now();
+  const hit = cache.get(key);
+  if (hit && hit.expiresAt > now) return hit.value;
+  const pending = inFlight.get(key);
+  if (pending) return pending;
+  const promise = (async () => {
+    const startedAt = Date.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), HL_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(HL_API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal
+      });
+    } catch (err) {
+      if (err?.name === "AbortError") {
+        throw new Error(`Hyperliquid timeout after ${HL_TIMEOUT_MS}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) throw new Error(`Hyperliquid ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    cache.set(key, { value: data, expiresAt: startedAt + ttlMs });
+    return data;
+  })();
+  inFlight.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    inFlight.delete(key);
+  }
+}
+async function fetchMetaAndCtxs() {
+  return cachedPost("metaAndCtxs", 2e4, { type: "metaAndAssetCtxs" });
+}
+async function fetchCandles(coin, interval, lookbackMs) {
+  coin = normalizeSymbol(coin);
+  interval = normalizeInterval(interval);
+  const endTime = Date.now();
+  const startTime = endTime - lookbackMs;
+  const barMs = intervalToLookbackMs(interval, 1);
+  const barBucket = Math.floor(endTime / barMs);
+  const key = `candles:${coin}:${interval}:${lookbackMs}:${barBucket}`;
+  const ttlMs = Math.min(barMs, 6e4);
+  return cachedPost(key, ttlMs, {
+    type: "candleSnapshot",
+    req: { coin, interval, startTime, endTime }
+  });
+}
+async function fetchL2Book(coin) {
+  coin = normalizeSymbol(coin);
+  return cachedPost(`l2:${coin}:${Math.floor(Date.now() / 5e3)}`, 5e3, {
+    type: "l2Book",
+    coin
+  });
+}
+async function fetchTrades(coin) {
+  coin = normalizeSymbol(coin);
+  return cachedPost(`trades:${coin}:${Math.floor(Date.now() / 1e4)}`, 1e4, {
+    type: "recentTrades",
+    coin
+  });
+}
+var INTERVAL_MS = {
+  "1m": 6e4,
+  "3m": 18e4,
+  "5m": 3e5,
+  "15m": 9e5,
+  "30m": 18e5,
+  "1h": 36e5,
+  "2h": 72e5,
+  "4h": 144e5,
+  "8h": 288e5,
+  "12h": 432e5,
+  "1d": 864e5,
+  "3d": 2592e5,
+  "1w": 6048e5
+};
+function normalizeSymbol(symbol) {
+  const normalized = symbol.trim().toUpperCase();
+  if (!normalized) throw new Error("symbol is required");
+  return normalized;
+}
+function normalizeInterval(interval) {
+  const normalized = interval.trim();
+  if (!Object.prototype.hasOwnProperty.call(INTERVAL_MS, normalized)) {
+    throw new Error(`Unsupported interval: ${interval}. Supported intervals: ${Object.keys(INTERVAL_MS).join(", ")}`);
+  }
+  return normalized;
+}
+function intervalToLookbackMs(interval, bars) {
+  const normalized = normalizeInterval(interval);
+  const ms = INTERVAL_MS[normalized];
+  if (ms === void 0) throw new Error(`Unsupported interval: ${interval}`);
+  return ms * bars;
+}
+function candlesToOhlcv(candles) {
+  return candles.map((c) => ({
+    time: Math.floor(c.t / 1e3),
+    open: Number(c.o),
+    high: Number(c.h),
+    low: Number(c.l),
+    close: Number(c.c),
+    volume: Number(c.v)
+  }));
+}
+
+// src/engines/regime.ts
+var regime_exports = {};
+__export(regime_exports, {
+  garchRegime: () => garchRegime,
+  garchVolatility: () => garchVolatility,
+  hurstExponent: () => hurstExponent,
+  logReturns: () => logReturns,
+  regimeFromHurst: () => regimeFromHurst,
+  rollingGarchHistory: () => rollingGarchHistory
+});
+function logReturns(closes) {
+  const out = [];
+  for (let i = 1; i < closes.length; i++) {
+    const a = closes[i - 1];
+    const b = closes[i];
+    if (a && b && a > 0 && b > 0) out.push(Math.log(b / a));
+  }
+  return out;
+}
+function rescaledRange(series) {
+  const n = series.length;
+  if (n < 4) return 0;
+  const mean = series.reduce((s, x) => s + x, 0) / n;
+  const dev = series.map((x) => x - mean);
+  const cum = [];
+  let acc = 0;
+  for (const d of dev) {
+    acc += d;
+    cum.push(acc);
+  }
+  const range = Math.max(...cum) - Math.min(...cum);
+  const variance = dev.reduce((s, d) => s + d * d, 0) / n;
+  const stdev = Math.sqrt(variance);
+  if (stdev === 0) return 0;
+  return range / stdev;
+}
+function hurstExponent(returns) {
+  if (returns.length < 64) return 0.5;
+  const minLen = 8;
+  const maxLen = Math.floor(returns.length / 2);
+  const points = [];
+  for (let len = minLen; len <= maxLen; len = Math.floor(len * 1.6)) {
+    const chunks = Math.floor(returns.length / len);
+    if (chunks < 1) continue;
+    let total = 0;
+    let count = 0;
+    for (let i = 0; i < chunks; i++) {
+      const slice = returns.slice(i * len, (i + 1) * len);
+      const rs = rescaledRange(slice);
+      if (rs > 0) {
+        total += rs;
+        count++;
+      }
+    }
+    if (count > 0) points.push([Math.log(len), Math.log(total / count)]);
+  }
+  if (points.length < 3) return 0.5;
+  const n = points.length;
+  const sumX = points.reduce((s, [x]) => s + x, 0);
+  const sumY = points.reduce((s, [, y]) => s + y, 0);
+  const sumXY = points.reduce((s, [x, y]) => s + x * y, 0);
+  const sumX2 = points.reduce((s, [x]) => s + x * x, 0);
+  const denom = n * sumX2 - sumX * sumX;
+  if (denom === 0) return 0.5;
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  return Math.max(0, Math.min(1, slope));
+}
+function regimeFromHurst(h) {
+  if (h < 0.45) return { label: "mean-reverting", multiplier: 1.4 };
+  if (h > 0.55) return { label: "trending", multiplier: 0.7 };
+  return { label: "random", multiplier: 1 };
+}
+function garchVolatility(returns) {
+  if (returns.length < 30) return 0;
+  const mean = returns.reduce((s, x) => s + x, 0) / returns.length;
+  const dev = returns.map((x) => x - mean);
+  const omega = 1e-6;
+  const alpha = 0.08;
+  const beta = 0.9;
+  let v = dev.reduce((s, d) => s + d * d, 0) / dev.length;
+  for (const d of dev) {
+    v = omega + alpha * d * d + beta * v;
+  }
+  return Math.sqrt(v);
+}
+function garchRegime(currentVol, history) {
+  if (history.length < 30) return "normal";
+  const sorted = [...history].sort((a, b) => a - b);
+  const p33 = sorted[Math.floor(sorted.length * 0.33)] ?? 0;
+  const p66 = sorted[Math.floor(sorted.length * 0.66)] ?? Infinity;
+  if (currentVol < p33) return "low";
+  if (currentVol > p66) return "high";
+  return "normal";
+}
+function rollingGarchHistory(returns, window = 50) {
+  const out = [];
+  for (let i = window; i <= returns.length; i++) {
+    out.push(garchVolatility(returns.slice(i - window, i)));
+  }
+  return out;
+}
+
+// src/engines/levels.ts
+var levels_exports = {};
+__export(levels_exports, {
+  buildPriceGrid: () => buildPriceGrid,
+  computeAtr: () => computeAtr,
+  findPivots: () => findPivots,
+  kde: () => kde,
+  kdePeaks: () => kdePeaks,
+  marketProfile: () => marketProfile,
+  recencyWeights: () => recencyWeights,
+  validateLevel: () => validateLevel
+});
+function findPivots(bars, k = 3) {
+  const highs = [];
+  const lows = [];
+  for (let i = k; i < bars.length - k; i++) {
+    const b = bars[i];
+    let isHigh = true, isLow = true;
+    for (let j = 1; j <= k; j++) {
+      const left = bars[i - j], right = bars[i + j];
+      if (left.high >= b.high || right.high >= b.high) isHigh = false;
+      if (left.low <= b.low || right.low <= b.low) isLow = false;
+    }
+    if (isHigh) highs.push(b);
+    if (isLow) lows.push(b);
+  }
+  return { highs, lows };
+}
+function kde(prices, grid, bandwidth, weights, volScale = 1) {
+  if (prices.length === 0 || grid.length === 0) return grid.map(() => 0);
+  const n = prices.length;
+  const w = weights && weights.length === n ? weights : prices.map(() => 1);
+  const wSum = w.reduce((s, x) => s + x, 0) || 1;
+  const mean = prices.reduce((s, x, i) => s + x * (w[i] ?? 1), 0) / wSum;
+  const variance = prices.reduce((s, x, i) => s + (w[i] ?? 1) * (x - mean) ** 2, 0) / wSum;
+  const sigma = Math.sqrt(variance) || 1;
+  const h = (bandwidth ?? 1.06 * sigma * Math.pow(n, -1 / 5)) * Math.max(0.5, volScale);
+  const norm = 1 / (wSum * h * Math.sqrt(2 * Math.PI));
+  return grid.map((g) => {
+    let s = 0;
+    for (let i = 0; i < n; i++) {
+      const u = (g - (prices[i] ?? 0)) / h;
+      s += (w[i] ?? 1) * Math.exp(-0.5 * u * u);
+    }
+    return s * norm;
+  });
+}
+function recencyWeights(n, lambda = 1.5) {
+  if (n <= 0) return [];
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const recency = (i + 1) / n;
+    out.push(Math.exp(-lambda * (1 - recency)));
+  }
+  return out;
+}
+function computeAtr(bars, period = 14) {
+  if (bars.length < 2) return 0;
+  const trs = [];
+  for (let i = 1; i < bars.length; i++) {
+    const b = bars[i], p = bars[i - 1];
+    const tr = Math.max(
+      b.high - b.low,
+      Math.abs(b.high - p.close),
+      Math.abs(b.low - p.close)
+    );
+    trs.push(tr);
+  }
+  const tail = trs.slice(-period);
+  return tail.reduce((s, x) => s + x, 0) / Math.max(1, tail.length);
+}
+function buildPriceGrid(min, max, bins = 200) {
+  const out = [];
+  const step = (max - min) / bins;
+  for (let i = 0; i <= bins; i++) out.push(min + step * i);
+  return out;
+}
+function kdePeaks(grid, density, minSeparation = 5) {
+  const peaks = [];
+  for (let i = 1; i < density.length - 1; i++) {
+    const d = density[i];
+    if (d > density[i - 1] && d > density[i + 1]) peaks.push({ price: grid[i], density: d });
+  }
+  peaks.sort((a, b) => b.density - a.density);
+  const kept = [];
+  const usedIdx = [];
+  for (const p of peaks) {
+    const idx = grid.indexOf(p.price);
+    if (usedIdx.every((u) => Math.abs(u - idx) >= minSeparation)) {
+      kept.push(p);
+      usedIdx.push(idx);
+    }
+  }
+  return kept;
+}
+function marketProfile(bars, bins = 80) {
+  if (bars.length === 0) return { bins: [], poc: 0, valueAreaHigh: 0, valueAreaLow: 0 };
+  let lo = Infinity, hi = -Infinity;
+  for (const b of bars) {
+    if (b.low < lo) lo = b.low;
+    if (b.high > hi) hi = b.high;
+  }
+  if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return { bins: [], poc: 0, valueAreaHigh: 0, valueAreaLow: 0 };
+  const step = (hi - lo) / bins;
+  const counts = new Array(bins).fill(0);
+  for (const b of bars) {
+    const lowIdx = Math.max(0, Math.floor((b.low - lo) / step));
+    const highIdx = Math.min(bins - 1, Math.floor((b.high - lo) / step));
+    for (let i = lowIdx; i <= highIdx; i++) counts[i] = (counts[i] ?? 0) + 1;
+  }
+  const out = counts.map((c, i) => ({ price: lo + step * (i + 0.5), timeAtPrice: c }));
+  const total = counts.reduce((s, c) => s + c, 0);
+  let pocIdx = 0;
+  for (let i = 1; i < counts.length; i++) if ((counts[i] ?? 0) > (counts[pocIdx] ?? 0)) pocIdx = i;
+  const target = total * 0.7;
+  let acc = counts[pocIdx] ?? 0;
+  let lowI = pocIdx, highI = pocIdx;
+  while (acc < target && (lowI > 0 || highI < counts.length - 1)) {
+    const left = lowI > 0 ? counts[lowI - 1] ?? 0 : -1;
+    const right = highI < counts.length - 1 ? counts[highI + 1] ?? 0 : -1;
+    if (right >= left) {
+      highI++;
+      acc += counts[highI] ?? 0;
+    } else {
+      lowI--;
+      acc += counts[lowI] ?? 0;
+    }
+  }
+  return {
+    bins: out,
+    poc: lo + step * (pocIdx + 0.5),
+    valueAreaHigh: lo + step * (highI + 1),
+    valueAreaLow: lo + step * lowI
+  };
+}
+function validateLevel(bars, price, tolerance, lookahead = 5, decayLambda = 2, opts) {
+  const atr = opts?.atr ?? 0;
+  const oosFrac = opts?.oosFrac ?? 0.3;
+  const priorAlpha = opts?.priorAlpha ?? 2;
+  const priorBeta = opts?.priorBeta ?? 2;
+  const detectionIndex = opts?.detectionIndex ?? Math.floor(bars.length * (1 - oosFrac));
+  const staleBars = opts?.staleBars ?? 200;
+  const minMove = Math.max(tolerance * 2, atr * 0.75);
+  const touchEvents = [];
+  for (let i = 0; i < bars.length - lookahead; i++) {
+    const b = bars[i];
+    if (b.low <= price + tolerance && b.high >= price - tolerance) {
+      const after = bars.slice(i + 1, i + 1 + lookahead);
+      const refClose = b.close;
+      const moved = after.some((x) => Math.abs(x.close - refClose) > minMove);
+      touchEvents.push({ idx: i, bounced: moved });
+    }
+  }
+  const n = touchEvents.length;
+  const lastTouchIdx = n > 0 ? touchEvents[n - 1].idx : -1;
+  const lastTouchAge = lastTouchIdx >= 0 ? bars.length - 1 - lastTouchIdx : Infinity;
+  const isStale = lastTouchAge > staleBars;
+  if (n === 0)
+    return {
+      touches: 0,
+      bounceRate: 0,
+      pValue: 1,
+      oosTouches: 0,
+      oosBounceRate: 0,
+      posteriorBounceRate: priorAlpha / (priorAlpha + priorBeta),
+      lastTouchAge: Infinity,
+      isStale: true
+    };
+  let wSum = 0;
+  let wBounces = 0;
+  for (let j = 0; j < n; j++) {
+    const recencyFrac = (j + 1) / n;
+    const w = Math.exp(-decayLambda * (1 - recencyFrac));
+    wSum += w;
+    if (touchEvents[j].bounced) wBounces += w;
+  }
+  const bounceRate = wSum > 0 ? wBounces / wSum : 0;
+  const oosEvents = touchEvents.filter((t) => t.idx >= detectionIndex);
+  const oosTouches = oosEvents.length;
+  const oosBounceRate = oosTouches ? oosEvents.filter((t) => t.bounced).length / oosTouches : 0;
+  let pValue = 1;
+  if (n >= 3) {
+    const k2 = touchEvents.filter((t) => t.bounced).length;
+    let cum = 0;
+    for (let i = k2; i <= n; i++) cum += binom(n, i) * Math.pow(0.5, n);
+    pValue = Math.min(1, cum);
+  }
+  const k = touchEvents.filter((t) => t.bounced).length;
+  const posteriorBounceRate = (priorAlpha + k) / (priorAlpha + priorBeta + n);
+  return { touches: n, bounceRate, pValue, oosTouches, oosBounceRate, posteriorBounceRate, lastTouchAge, isStale };
+}
+function binom(n, k) {
+  if (k < 0 || k > n) return 0;
+  let r = 1;
+  for (let i = 0; i < k; i++) r = r * (n - i) / (i + 1);
+  return r;
+}
+
+// src/engines/orderflow.ts
+var orderflow_exports = {};
+__export(orderflow_exports, {
+  bucketTradesByCandle: () => bucketTradesByCandle,
+  computeObi: () => computeObi,
+  computeVpin: () => computeVpin
+});
+function computeVpin(trades, bucketSize, numBuckets = 50) {
+  if (trades.length === 0 || bucketSize <= 0) return 0;
+  const buckets = [];
+  let cur = { buy: 0, sell: 0 };
+  let curVol = 0;
+  for (const t of trades) {
+    const sz = Number(t.sz);
+    if (t.side === "B") cur.buy += sz;
+    else cur.sell += sz;
+    curVol += sz;
+    if (curVol >= bucketSize) {
+      buckets.push(cur);
+      cur = { buy: 0, sell: 0 };
+      curVol = 0;
+      if (buckets.length >= numBuckets) break;
+    }
+  }
+  if (buckets.length === 0) return 0;
+  let sum = 0;
+  for (const b of buckets) {
+    const tot = b.buy + b.sell;
+    if (tot > 0) sum += Math.abs(b.buy - b.sell) / tot;
+  }
+  return sum / buckets.length;
+}
+function computeObi(book, depth = 10) {
+  const [bids, asks] = book.levels;
+  let bidVol = 0, askVol = 0;
+  for (let i = 0; i < Math.min(depth, bids.length); i++) bidVol += Number(bids[i]?.sz ?? 0);
+  for (let i = 0; i < Math.min(depth, asks.length); i++) askVol += Number(asks[i]?.sz ?? 0);
+  const tot = bidVol + askVol;
+  if (tot === 0) return 0;
+  return (bidVol - askVol) / tot;
+}
+function bucketTradesByCandle(trades, candleMs) {
+  const map = /* @__PURE__ */ new Map();
+  for (const t of trades) {
+    const bucket = Math.floor(t.time / candleMs) * candleMs;
+    let agg = map.get(bucket);
+    if (!agg) {
+      agg = { buy: 0, sell: 0 };
+      map.set(bucket, agg);
+    }
+    const sz = Number(t.sz);
+    if (t.side === "B") agg.buy += sz;
+    else agg.sell += sz;
+  }
+  return map;
+}
+
+// src/orderflowBuffer.ts
+var WINDOW_MS = 6e4;
+var buffers = /* @__PURE__ */ new Map();
+function recordOrderFlow(symbol, obi, vpin) {
+  const arr = buffers.get(symbol) ?? [];
+  const now = Date.now();
+  arr.push({ t: now, obi, vpin });
+  const cutoff = now - WINDOW_MS;
+  while (arr.length > 0 && (arr[0]?.t ?? 0) < cutoff) arr.shift();
+  buffers.set(symbol, arr);
+}
+function sustainedOrderFlow(symbol) {
+  const arr = buffers.get(symbol) ?? [];
+  if (arr.length === 0) {
+    return { meanObi: 0, meanVpin: 0, fracObiBidHeavy: 0, fracObiAskHeavy: 0, samples: 0 };
+  }
+  let sumObi = 0, sumVpin = 0, bidHeavy = 0, askHeavy = 0;
+  for (const s of arr) {
+    sumObi += s.obi;
+    sumVpin += s.vpin;
+    if (s.obi > 0.15) bidHeavy++;
+    if (s.obi < -0.15) askHeavy++;
+  }
+  return {
+    meanObi: sumObi / arr.length,
+    meanVpin: sumVpin / arr.length,
+    fracObiBidHeavy: bidHeavy / arr.length,
+    fracObiAskHeavy: askHeavy / arr.length,
+    samples: arr.length
+  };
+}
+
+// src/engines/confluence.ts
+var confluence_exports = {};
+__export(confluence_exports, {
+  mergeIntoZones: () => mergeIntoZones
+});
+var METHOD_WEIGHTS = {
+  "kde-pivot-cluster": 1,
+  "market-profile-poc": 1.2,
+  "value-area-high": 0.7,
+  "value-area-low": 0.7,
+  "swing-pivot": 0.6,
+  "quantile-band": 0.8,
+  "large-resting-order": 0.95,
+  "absorption": 1.05,
+  "delta-exhaustion": 0.9,
+  "vwoe": 0.75,
+  "tape-vwap-inside": 0.65,
+  "tape-vwap-clamped": 0.45,
+  "order-flow-confirmation": 0.85,
+  "absorption-confirmation": 1.1,
+  "large-resting-order-confirmation": 1,
+  "delta-exhaustion-confirmation": 0.95,
+  "real-orderbook-wall": 0.9,
+  "resting-liquidity-wall": 1,
+  "spoof-adjusted-liquidity-wall": 0.85,
+  "iceberg-detection-level": 0.95,
+  "liquidity-heatmap-cluster": 0.9,
+  "bid-stack-level": 0.75,
+  "ask-stack-level": 0.75
+};
+function weightFor(method) {
+  return METHOD_WEIGHTS[method] ?? 0.5;
+}
+function mergeIntoZones(levels, proximityPct = 15e-4) {
+  if (levels.length === 0) return [];
+  const sorted = [...levels].sort((a, b) => a.price - b.price);
+  const groups = [];
+  let cur = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const lvl = sorted[i];
+    const ref = cur[cur.length - 1].price;
+    if (Math.abs(lvl.price - ref) / ref <= proximityPct) cur.push(lvl);
+    else {
+      groups.push(cur);
+      cur = [lvl];
+    }
+  }
+  groups.push(cur);
+  return groups.map((g) => {
+    const prices = g.map((l) => l.price);
+    const supports = g.filter((l) => l.kind === "support").length;
+    const resistances = g.filter((l) => l.kind === "resistance").length;
+    const kind = supports > resistances ? "support" : resistances > supports ? "resistance" : "neutral";
+    const methods = Array.from(new Set(g.map((l) => l.method)));
+    const score = g.reduce((s, l) => s + l.strength * weightFor(l.method), 0) + g.filter((l) => l.validated).reduce((s, l) => s + weightFor(l.method) * 0.5, 0);
+    const validatedLevels = g.filter((l) => l.validated && l.bounceRate !== null);
+    const avgBounce = validatedLevels.length ? validatedLevels.reduce((s, l) => s + (l.bounceRate ?? 0), 0) / validatedLevels.length : null;
+    const minP = validatedLevels.length ? Math.min(...validatedLevels.map((l) => l.pValue ?? 1)) : null;
+    return {
+      priceLow: Math.min(...prices),
+      priceHigh: Math.max(...prices),
+      score,
+      kind,
+      methods,
+      bounceRate: avgBounce,
+      pValue: minP
+    };
+  });
+}
+
+// src/engines/precision.ts
+var precision_exports = {};
+__export(precision_exports, {
+  absorptionEntry: () => absorptionEntry,
+  deltaExhaustion: () => deltaExhaustion,
+  largestRestingOrder: () => largestRestingOrder,
+  pickPrecisionEntry: () => pickPrecisionEntry,
+  vwoe: () => vwoe
+});
+function largestRestingOrder(book, low, high) {
+  const all = [...book.levels[0], ...book.levels[1]];
+  let best = null;
+  for (const lvl of all) {
+    const px = Number(lvl.px);
+    const sz = Number(lvl.sz);
+    if (px >= low && px <= high) {
+      if (!best || sz > best.sz) best = { px, sz };
+    }
+  }
+  if (!best) return null;
+  return { price: best.px, method: "large-resting-order", confidence: Math.min(1, best.sz / 1e3) };
+}
+function absorptionEntry(trades, low, high) {
+  const buckets = /* @__PURE__ */ new Map();
+  const tickSize = (high - low) / 50;
+  if (tickSize <= 0) return null;
+  for (const t of trades) {
+    const px = Number(t.px);
+    if (px < low || px > high) continue;
+    const bucket = Math.floor((px - low) / tickSize);
+    let agg = buckets.get(bucket);
+    if (!agg) {
+      agg = { buy: 0, sell: 0 };
+      buckets.set(bucket, agg);
+    }
+    const sz = Number(t.sz);
+    if (t.side === "B") agg.buy += sz;
+    else agg.sell += sz;
+  }
+  let bestBucket = -1;
+  let bestScore = 0;
+  for (const [b, agg] of buckets) {
+    const total = agg.buy + agg.sell;
+    if (total === 0) continue;
+    const imbalance = Math.abs(agg.buy - agg.sell) / total;
+    const score = imbalance * total;
+    if (score > bestScore) {
+      bestScore = score;
+      bestBucket = b;
+    }
+  }
+  if (bestBucket < 0) return null;
+  return {
+    price: low + (bestBucket + 0.5) * tickSize,
+    method: "absorption",
+    confidence: Math.min(1, bestScore / 100)
+  };
+}
+function deltaExhaustion(bars, low, high) {
+  let best = null;
+  for (let i = 1; i < bars.length; i++) {
+    const b = bars[i];
+    if (b.low > high || b.high < low) continue;
+    const range = b.high - b.low;
+    const wickLow = Math.max(0, Math.min(b.open, b.close) - b.low);
+    const wickHigh = Math.max(0, b.high - Math.max(b.open, b.close));
+    const wick = Math.max(wickLow, wickHigh);
+    const mag = wick / Math.max(range, 1e-9) * b.volume;
+    const px = wickLow > wickHigh ? b.low : b.high;
+    if (px >= low && px <= high && (!best || mag > best.mag)) best = { price: px, mag };
+  }
+  if (!best) return null;
+  return { price: best.price, method: "delta-exhaustion", confidence: Math.min(1, best.mag / 1e3) };
+}
+function vwoe(trades, low, high) {
+  let pxVol = 0, vol = 0;
+  for (const t of trades) {
+    const px = Number(t.px);
+    if (px < low || px > high) continue;
+    const sz = Number(t.sz);
+    pxVol += px * sz;
+    vol += sz;
+  }
+  if (vol === 0) return null;
+  return { price: pxVol / vol, method: "vwoe", confidence: Math.min(1, vol / 100) };
+}
+function tapeFallback(trades, low, high, mid, n = 200) {
+  const recent = trades.slice(-n);
+  const inside = recent.filter((t) => {
+    const px = Number(t.px);
+    return px >= low && px <= high;
+  });
+  if (inside.length > 0) {
+    let pxVol = 0, vol = 0;
+    for (const t of inside) {
+      const px = Number(t.px);
+      const sz = Number(t.sz);
+      pxVol += px * sz;
+      vol += sz;
+    }
+    if (vol > 0) return { price: pxVol / vol, method: "tape-vwap-inside" };
+  }
+  if (recent.length > 0) {
+    let pxVol = 0, vol = 0;
+    for (const t of recent) {
+      const sz = Number(t.sz);
+      pxVol += Math.min(Math.max(Number(t.px), low), high) * sz;
+      vol += sz;
+    }
+    if (vol > 0) return { price: pxVol / vol, method: "tape-vwap-clamped" };
+  }
+  return { price: mid, method: "midpoint" };
+}
+function pickPrecisionEntry(bars, trades, book, low, high, fallback2) {
+  const candidates = [
+    largestRestingOrder(book, low, high),
+    absorptionEntry(trades, low, high),
+    deltaExhaustion(bars, low, high),
+    vwoe(trades, low, high)
+  ].filter(Boolean);
+  if (candidates.length === 0) return tapeFallback(trades, low, high, fallback2);
+  candidates.sort((a, b) => b.confidence - a.confidence);
+  const top = candidates[0];
+  return { price: top.price, method: top.method };
+}
+
+// src/engines/reliability.ts
+var reliability_exports = {};
+__export(reliability_exports, {
+  confirmZone: () => confirmZone,
+  findDivergences: () => findDivergences,
+  isReversalCandle: () => isReversalCandle,
+  isVolumeSurge: () => isVolumeSurge,
+  rsi: () => rsi
+});
+function isReversalCandle(bar, kind) {
+  const range = bar.high - bar.low;
+  if (range <= 0) return false;
+  const body = Math.abs(bar.close - bar.open);
+  const wickLow = Math.min(bar.open, bar.close) - bar.low;
+  const wickHigh = bar.high - Math.max(bar.open, bar.close);
+  if (kind === "support") return wickLow > body * 1.5 && wickLow / range > 0.5;
+  if (kind === "resistance") return wickHigh > body * 1.5 && wickHigh / range > 0.5;
+  return false;
+}
+function isVolumeSurge(bars, idx, lookback = 50, sigmaK = 1.5) {
+  if (idx < lookback) return false;
+  const recent = bars.slice(idx - lookback, idx);
+  const mean = recent.reduce((s, b) => s + b.volume, 0) / recent.length;
+  const variance = recent.reduce((s, b) => s + (b.volume - mean) ** 2, 0) / recent.length;
+  const sigma = Math.sqrt(variance);
+  const cur = bars[idx]?.volume ?? 0;
+  return cur > mean + sigmaK * sigma;
+}
+function confirmZone(bars, low, high, kind) {
+  const window = Math.min(bars.length, 60);
+  const start = bars.length - window;
+  let firstTestIdx = -1;
+  for (let i = start; i < bars.length; i++) {
+    const b2 = bars[i];
+    if (b2.low <= high && b2.high >= low) {
+      firstTestIdx = i;
+      break;
+    }
+  }
+  if (firstTestIdx < 0) return false;
+  const b = bars[firstTestIdx];
+  const closesInReversalDir = kind === "support" ? b.close > (b.low + b.high) / 2 : kind === "resistance" ? b.close < (b.low + b.high) / 2 : false;
+  if (!closesInReversalDir) return false;
+  if (!isReversalCandle(b, kind)) return false;
+  if (!isVolumeSurge(bars, firstTestIdx)) return false;
+  return true;
+}
+function rsi(closes, period = 14) {
+  if (closes.length < period + 1) return [];
+  const out = [];
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = (closes[i] ?? 0) - (closes[i - 1] ?? 0);
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  out.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = (closes[i] ?? 0) - (closes[i - 1] ?? 0);
+    const g = diff > 0 ? diff : 0;
+    const l = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + g) / period;
+    avgLoss = (avgLoss * (period - 1) + l) / period;
+    out.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss));
+  }
+  return out;
+}
+function findDivergences(bars) {
+  const closes = bars.map((b) => b.close);
+  const r = rsi(closes);
+  if (r.length < 20) return [];
+  const offset = closes.length - r.length;
+  const out = [];
+  const window = 5;
+  for (let i = window; i < r.length - window; i++) {
+    const barIdx = i + offset;
+    const b = bars[barIdx];
+    if (!b) continue;
+    const priceSlice = closes.slice(barIdx - window, barIdx + window + 1);
+    const rsiSlice = r.slice(i - window, i + window + 1);
+    const isPriceLow = priceSlice.every((p) => p >= b.close);
+    const isPriceHigh = priceSlice.every((p) => p <= b.close);
+    const rsiCenter = rsiSlice[window] ?? 50;
+    const isRsiHigher = rsiSlice.every((x) => x <= rsiCenter);
+    const isRsiLower = rsiSlice.every((x) => x >= rsiCenter);
+    if (isPriceLow && isRsiHigher) out.push({ time: b.time, price: b.low, kind: "bullish", magnitude: rsiCenter });
+    if (isPriceHigh && isRsiLower) out.push({ time: b.time, price: b.high, kind: "bearish", magnitude: rsiCenter });
+  }
+  return out.slice(-8);
+}
+
+// src/engines/crosspair.ts
+var crosspair_exports = {};
+__export(crosspair_exports, {
+  computeCrossPairZScores: () => computeCrossPairZScores
+});
+var PAIRS = [
+  ["BTC", "ETH"],
+  ["BTC", "SOL"],
+  ["ETH", "SOL"]
+];
+function logReturns2(xs) {
+  const out = [];
+  for (let i = 1; i < xs.length; i++) {
+    const prev = xs[i - 1] ?? 0;
+    const cur = xs[i] ?? 0;
+    if (prev > 0 && cur > 0) out.push(Math.log(cur / prev));
+  }
+  return out;
+}
+function pearson(a, b) {
+  const n = Math.min(a.length, b.length);
+  if (n < 2) return 0;
+  const aT = a.slice(a.length - n);
+  const bT = b.slice(b.length - n);
+  const ma = aT.reduce((s, x) => s + x, 0) / n;
+  const mb = bT.reduce((s, x) => s + x, 0) / n;
+  let num = 0, da = 0, db = 0;
+  for (let i = 0; i < n; i++) {
+    const xa = (aT[i] ?? 0) - ma;
+    const xb = (bT[i] ?? 0) - mb;
+    num += xa * xb;
+    da += xa * xa;
+    db += xb * xb;
+  }
+  const denom = Math.sqrt(da * db) || 1e-12;
+  return num / denom;
+}
+async function computeCrossPairZScores() {
+  const bars = 90;
+  const interval = "1d";
+  const lookback = intervalToLookbackMs(interval, bars);
+  const symbols = Array.from(new Set(PAIRS.flat()));
+  const series = /* @__PURE__ */ new Map();
+  await Promise.all(
+    symbols.map(async (s) => {
+      try {
+        const candles = await fetchCandles(s, interval, lookback);
+        series.set(s, candlesToOhlcv(candles).map((c) => c.close));
+      } catch {
+        series.set(s, []);
+      }
+    })
+  );
+  const out = [];
+  for (const [a, b] of PAIRS) {
+    const sa = series.get(a) ?? [];
+    const sb = series.get(b) ?? [];
+    const n = Math.min(sa.length, sb.length);
+    if (n < 30) continue;
+    const aTrim = sa.slice(sa.length - n);
+    const bTrim = sb.slice(sb.length - n);
+    const correlation = pearson(logReturns2(aTrim), logReturns2(bTrim));
+    const ratios = [];
+    for (let i = 0; i < n; i++) {
+      const va = aTrim[i] ?? 0, vb = bTrim[i] ?? 0;
+      if (vb !== 0) ratios.push(va / vb);
+    }
+    if (ratios.length === 0) continue;
+    const mean = ratios.reduce((s, x) => s + x, 0) / ratios.length;
+    const variance = ratios.reduce((s, x) => s + (x - mean) ** 2, 0) / ratios.length;
+    const stdev = Math.sqrt(variance) || 1;
+    const cur = ratios[ratios.length - 1] ?? mean;
+    const z2 = (cur - mean) / stdev;
+    let signal = "neutral";
+    if (z2 > 2) signal = "expand";
+    else if (z2 < -2) signal = "revert";
+    out.push({
+      pair: `${a}/${b}`,
+      ratio: cur,
+      meanRatio: mean,
+      zScore: z2,
+      correlation,
+      signal
+    });
+  }
+  return out;
+}
+
+// src/engines/quantile.ts
+var quantile_exports = {};
+__export(quantile_exports, {
+  quantileBands: () => quantileBands
+});
+function quantileBands(closes, quantiles = [0.05, 0.1, 0.9, 0.95]) {
+  const n = closes.length;
+  if (n < 20) return [];
+  let sx = 0, sy = 0, sxy = 0, sxx = 0;
+  for (let i = 0; i < n; i++) {
+    sx += i;
+    sy += closes[i];
+    sxy += i * closes[i];
+    sxx += i * i;
+  }
+  const denom = n * sxx - sx * sx;
+  const slope = denom !== 0 ? (n * sxy - sx * sy) / denom : 0;
+  const intercept = (sy - slope * sx) / n;
+  const lastIdx = n - 1;
+  const trendNow = intercept + slope * lastIdx;
+  const residuals = [];
+  for (let i = 0; i < n; i++) {
+    residuals.push(closes[i] - (intercept + slope * i));
+  }
+  residuals.sort((a, b) => a - b);
+  const empirical = (q) => {
+    const pos = q * (residuals.length - 1);
+    const lo = Math.floor(pos);
+    const hi = Math.ceil(pos);
+    const frac = pos - lo;
+    return residuals[lo] * (1 - frac) + residuals[hi] * frac;
+  };
+  return quantiles.map((q) => ({
+    price: trendNow + empirical(q),
+    quantile: q,
+    band: q < 0.5 ? "lower" : "upper"
+  }));
+}
+
+// src/ai/synthesis.ts
+import OpenAI from "openai";
+var baseURL = process.env["AI_INTEGRATIONS_OPENAI_BASE_URL"];
+var apiKey = process.env["AI_INTEGRATIONS_OPENAI_API_KEY"];
+var _client = null;
+function client() {
+  if (!_client) {
+    if (!baseURL || !apiKey) throw new Error("OpenAI integration env vars missing");
+    _client = new OpenAI({ baseURL, apiKey });
+  }
+  return _client;
+}
+var SYSTEM_PROMPT = `You are a quantitative trading analyst summarising a single statistical analysis run on a Hyperliquid perpetual contract. You receive: the regime (Hurst exponent + GARCH volatility regime), a list of confluence zones (each with a precise entry price, source methods, validated bounce rate, p-value, and confirmation flag), a set of live order-flow signals, and cross-pair correlation z-scores.
+
+Produce ONE plain-English assessment for the trader. Be terse, confident, never hedged with disclaimers. Do not mention stops, risk management, or position sizing \u2014 that is not your job. Do not invent classic chart patterns. Speak only about what the statistics say.
+
+Output strict JSON with these fields:
+- summary: one short sentence (under 25 words)
+- confidence: "HIGH" | "MEDIUM" | "LOW"
+- recommendedEntry: number (the precise entry price of the highest-scoring confirmed zone aligned with the dominant direction) or null if nothing actionable
+- direction: "long" | "short" | "neutral"
+- reasoning: 2-4 short bullets, each under 14 words, citing actual signals/zones
+- consistency: one short phrase rating how well the signals agree (e.g. "tight agreement", "split signals", "mixed flow")
+
+Only output the JSON object \u2014 no prose, no markdown.`;
+var TTL_MS = 3e4;
+var cache2 = /* @__PURE__ */ new Map();
+function cacheKey(input) {
+  const zonesKey = input.zones.map((z2) => `${z2.kind}:${z2.preciseEntryPrice.toFixed(2)}:${z2.score.toFixed(1)}:${z2.confirmed ? 1 : 0}`).join("|");
+  const sigKey = input.signals.map((s) => `${s.name}:${typeof s.value === "number" ? s.value.toFixed(3) : s.value}`).join("|");
+  return `${input.symbol}|${input.interval}|${input.regime.regimeLabel}|${input.regime.garchRegime}|${zonesKey}|${sigKey}`;
+}
+async function synthesize(input) {
+  const key = cacheKey(input);
+  const now = Date.now();
+  const hit = cache2.get(key);
+  if (hit && hit.expiresAt > now) return hit.value;
+  let value;
+  try {
+    const userPrompt = JSON.stringify(input);
+    const resp = await client().chat.completions.create({
+      model: "gpt-5.2",
+      max_completion_tokens: 600,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userPrompt }
+      ]
+    });
+    const text = resp.choices[0]?.message?.content ?? "{}";
+    const parsed = JSON.parse(text);
+    value = normalize(parsed, input);
+  } catch {
+    value = fallback(input);
+  }
+  cache2.set(key, { value, expiresAt: now + TTL_MS });
+  if (cache2.size > 200) {
+    const keys = [...cache2.keys()].slice(0, cache2.size - 200);
+    for (const k of keys) cache2.delete(k);
+  }
+  return value;
+}
+function normalize(p, input) {
+  const obj = p && typeof p === "object" ? p : {};
+  const dir = obj["direction"] ?? "neutral";
+  const conf = obj["confidence"] ?? "LOW";
+  return {
+    summary: obj["summary"] ?? fallback(input).summary,
+    confidence: ["HIGH", "MEDIUM", "LOW"].includes(conf) ? conf : "LOW",
+    recommendedEntry: typeof obj["recommendedEntry"] === "number" ? obj["recommendedEntry"] : null,
+    direction: ["long", "short", "neutral"].includes(dir) ? dir : "neutral",
+    reasoning: Array.isArray(obj["reasoning"]) ? obj["reasoning"].slice(0, 4) : [],
+    consistency: obj["consistency"] ?? "insufficient signal"
+  };
+}
+function fallback(input) {
+  const top = [...input.zones].sort((a, b) => b.score - a.score)[0];
+  if (!top) {
+    return {
+      summary: "No confluence above current statistical thresholds.",
+      confidence: "LOW",
+      recommendedEntry: null,
+      direction: "neutral",
+      reasoning: ["No qualifying zones detected"],
+      consistency: "no signal"
+    };
+  }
+  const dir = top.kind === "support" ? "long" : top.kind === "resistance" ? "short" : "neutral";
+  return {
+    summary: `${top.kind} confluence at ${top.preciseEntryPrice.toFixed(2)} with ${top.methods.length} methods agreeing.`,
+    confidence: top.confirmed && (top.bounceRate ?? 0) > 0.6 ? "HIGH" : top.score > 2 ? "MEDIUM" : "LOW",
+    recommendedEntry: top.preciseEntryPrice,
+    direction: dir,
+    reasoning: [
+      `Regime: ${input.regime.regimeLabel} (H=${input.regime.hurst.toFixed(2)})`,
+      `${top.methods.length} methods agree at this zone`,
+      top.confirmed ? "Reversal candle + volume surge confirmed" : "Awaiting confirmation"
+    ],
+    consistency: input.zones.length > 3 ? "multiple zones present" : "single zone"
+  };
+}
+
+// src/cache.ts
+import { createHash } from "crypto";
+var TtlCache = class {
+  constructor(ttlMs, maxSize = 200) {
+    this.ttlMs = ttlMs;
+    this.maxSize = maxSize;
+  }
+  ttlMs;
+  maxSize;
+  store = /* @__PURE__ */ new Map();
+  inFlight = /* @__PURE__ */ new Map();
+  async get(key, compute) {
+    const now = Date.now();
+    const hit = this.store.get(key);
+    if (hit && hit.expiresAt > now) {
+      return { value: hit.value, etag: hit.etag, expiresAt: hit.expiresAt, hit: true };
+    }
+    const pending = this.inFlight.get(key);
+    if (pending) {
+      const r = await pending.promise;
+      return { value: r.value, etag: r.etag, expiresAt: r.expiresAt, hit: true };
+    }
+    const promise = (async () => {
+      const value = await compute();
+      const etag = etagFor(value);
+      const expiresAt = Date.now() + this.ttlMs;
+      this.store.set(key, { value, etag, expiresAt });
+      if (this.store.size > this.maxSize) {
+        const drop = this.store.size - this.maxSize;
+        const keys = [...this.store.keys()].slice(0, drop);
+        for (const k of keys) this.store.delete(k);
+      }
+      return { value, etag, expiresAt };
+    })();
+    this.inFlight.set(key, { promise });
+    try {
+      const r = await promise;
+      return { value: r.value, etag: r.etag, expiresAt: r.expiresAt, hit: false };
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+  async getStaleWhileRevalidate(key, compute, staleTtlMs = this.ttlMs * 4) {
+    const now = Date.now();
+    const hit = this.store.get(key);
+    if (hit && hit.expiresAt > now) {
+      return { value: hit.value, etag: hit.etag, expiresAt: hit.expiresAt, hit: true, stale: false };
+    }
+    if (hit && hit.expiresAt + staleTtlMs > now) {
+      if (!this.inFlight.has(key)) {
+        const promise = (async () => {
+          const value = await compute();
+          const etag = etagFor(value);
+          const expiresAt = Date.now() + this.ttlMs;
+          this.store.set(key, { value, etag, expiresAt });
+          if (this.store.size > this.maxSize) {
+            const drop = this.store.size - this.maxSize;
+            const keys = [...this.store.keys()].slice(0, drop);
+            for (const k of keys) this.store.delete(k);
+          }
+          return { value, etag, expiresAt };
+        })();
+        this.inFlight.set(key, { promise });
+        void promise.finally(() => this.inFlight.delete(key));
+      }
+      return { value: hit.value, etag: hit.etag, expiresAt: hit.expiresAt, hit: true, stale: true };
+    }
+    return this.get(key, compute);
+  }
+  invalidate(key) {
+    this.store.delete(key);
+  }
+  clear() {
+    this.store.clear();
+  }
+  // Background warmer: re-run `compute` shortly before the entry expires so
+  // foreground requests keep hitting warm cache. Returns a stop function.
+  scheduleRefresh(key, compute, intervalMs) {
+    const period = intervalMs ?? Math.max(5e3, Math.floor(this.ttlMs * 0.8));
+    const tick = async () => {
+      try {
+        const value = await compute();
+        const etag = etagFor(value);
+        this.store.set(key, { value, etag, expiresAt: Date.now() + this.ttlMs });
+      } catch {
+      }
+    };
+    void tick();
+    const handle = setInterval(tick, period);
+    if (typeof handle.unref === "function") handle.unref();
+    return () => clearInterval(handle);
+  }
+};
+var DEFAULT_ETAG_OMIT_KEYS = /* @__PURE__ */ new Set(["generatedAt"]);
+function normalizeForEtag(value, omitKeys = DEFAULT_ETAG_OMIT_KEYS) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => normalizeForEtag(item, omitKeys));
+  const normalized = {};
+  for (const key of Object.keys(value).sort()) {
+    if (omitKeys.has(key)) continue;
+    normalized[key] = normalizeForEtag(value[key], omitKeys);
+  }
+  return normalized;
+}
+function etagFor(value, omitKeys = DEFAULT_ETAG_OMIT_KEYS) {
+  const json = JSON.stringify(normalizeForEtag(value, new Set(omitKeys)));
+  return `"${createHash("sha1").update(json).digest("base64url").slice(0, 24)}"`;
+}
+function sendCached(res, req, result, ttlSeconds) {
+  const maxAge = Math.max(1, Math.floor((result.expiresAt - Date.now()) / 1e3));
+  res.setHeader("Cache-Control", `public, max-age=${maxAge}, stale-while-revalidate=${ttlSeconds}`);
+  res.setHeader("ETag", result.etag);
+  const ifNoneMatch = req.headers["if-none-match"];
+  if (ifNoneMatch && ifNoneMatch === result.etag) {
+    res.status(304).end();
+    return;
+  }
+  res.json(result.value);
+}
+
+// src/orchestrator.ts
+var LEVELS_TTL_MS = 3e4;
+var REGIME_TTL_MS = 6e4;
+var PROFILE_TTL_MS = 6e4;
+var ZONES_ONLY_TTL_MS = 6e4;
+var OVERLAY_TTL_MS = 15e3;
+var ALL_SOURCE_OVERLAP_TTL_MS = 8e3;
+var levelsCache = new TtlCache(LEVELS_TTL_MS);
+var regimeCache = new TtlCache(REGIME_TTL_MS);
+var profileCache = new TtlCache(PROFILE_TTL_MS);
+var zoneOnlyCache = new TtlCache(ZONES_ONLY_TTL_MS, 500);
+var overlayCache = new TtlCache(OVERLAY_TTL_MS, 300);
+var allSourceOverlapCache = new TtlCache(ALL_SOURCE_OVERLAP_TTL_MS, 500);
+function normalizedKey(symbol, interval) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const normalizedInterval = normalizeInterval(interval);
+  return { symbol: normalizedSymbol, interval: normalizedInterval, key: `${normalizedSymbol}|${normalizedInterval}` };
+}
+function getCachedLevels(symbol, interval) {
+  const n = normalizedKey(symbol, interval);
+  return levelsCache.get(n.key, () => computeLevelsData(n.symbol, n.interval));
+}
+function getCachedRegime(symbol, interval) {
+  const n = normalizedKey(symbol, interval);
+  return regimeCache.get(n.key, () => computeRegimeData(n.symbol, n.interval));
+}
+function getCachedMarketProfile(symbol, interval) {
+  const n = normalizedKey(symbol, interval);
+  return profileCache.get(n.key, () => computeMarketProfileData(n.symbol, n.interval));
+}
+function getCachedLevelsStale(symbol, interval) {
+  const n = normalizedKey(symbol, interval);
+  return levelsCache.getStaleWhileRevalidate(
+    n.key,
+    () => computeLevelsData(n.symbol, n.interval),
+    LEVELS_TTL_MS * 4
+  );
+}
+function getCachedLevelsOverlay(symbol, interval) {
+  const n = normalizedKey(symbol, interval);
+  const key = `${n.key}|overlay`;
+  return overlayCache.getStaleWhileRevalidate(
+    key,
+    async () => toOverlayData(await computeLevelsData(n.symbol, n.interval, {
+      includeAi: false,
+      includeCrossPairReport: false
+    })),
+    OVERLAY_TTL_MS * 6
+  );
+}
+function normalizeAllSourceOverlapOptions(options = {}) {
+  const minStrength = options.minStrength === "elite" || options.minStrength === "strong" || options.minStrength === "developing" ? options.minStrength : "developing";
+  const rawLimit = options.limit === void 0 ? 20 : Number(options.limit);
+  const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(80, Math.floor(rawLimit))) : 20;
+  const includeLive = options.includeLive ?? true;
+  const rawBudget = options.liveBudgetMs === void 0 ? 450 : Number(options.liveBudgetMs);
+  const liveBudgetMs = Number.isFinite(rawBudget) ? Math.max(50, Math.min(2e3, Math.floor(rawBudget))) : 450;
+  return { minStrength, limit, includeLive, liveBudgetMs };
+}
+function allSourceOverlapCacheKey(symbol, interval, options) {
+  return `${symbol}|${interval}|all-source-overlap:v2|min=${options.minStrength}|limit=${options.limit}|live=${options.includeLive}|budget=${options.liveBudgetMs}`;
+}
+function getCachedAllSourceOverlap(symbol, interval = "4h", options = {}) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const normalizedInterval = normalizeInterval(interval);
+  const normalizedOptions = normalizeAllSourceOverlapOptions(options);
+  const key = allSourceOverlapCacheKey(normalizedSymbol, normalizedInterval, normalizedOptions);
+  return allSourceOverlapCache.getStaleWhileRevalidate(
+    key,
+    () => computeAllSourceOverlapData(normalizedSymbol, normalizedInterval, normalizedOptions),
+    ALL_SOURCE_OVERLAP_TTL_MS * 15
+  );
+}
+function prewarmAllSourceOverlap(symbol, interval = "4h", options = {}) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const normalizedInterval = normalizeInterval(interval);
+  void getCachedAllSourceOverlap(normalizedSymbol, normalizedInterval, options).catch(() => {
+  });
+}
+var getCachedConfluenceOverlay = getCachedAllSourceOverlap;
+var prewarmConfluenceOverlay = prewarmAllSourceOverlap;
+var refreshHandles = /* @__PURE__ */ new Map();
+function scheduleLevelsRefresh(symbol, interval) {
+  const n = normalizedKey(symbol, interval);
+  if (refreshHandles.has(n.key)) return;
+  const stop = levelsCache.scheduleRefresh(
+    n.key,
+    () => computeLevelsData(n.symbol, n.interval)
+  );
+  refreshHandles.set(n.key, stop);
+}
+function scheduleAllSourceOverlapRefresh(symbol, interval = "4h", options = {}) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const normalizedInterval = normalizeInterval(interval);
+  const normalizedOptions = normalizeAllSourceOverlapOptions(options);
+  const key = allSourceOverlapCacheKey(normalizedSymbol, normalizedInterval, normalizedOptions);
+  if (refreshHandles.has(key)) return;
+  const stop = allSourceOverlapCache.scheduleRefresh(
+    key,
+    () => computeAllSourceOverlapData(normalizedSymbol, normalizedInterval, normalizedOptions),
+    Math.max(4e3, Math.floor(ALL_SOURCE_OVERLAP_TTL_MS * 0.75))
+  );
+  refreshHandles.set(key, stop);
+}
+function stopAllSourceOverlapRefresh(symbol, interval = "4h", options = {}) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const normalizedInterval = normalizeInterval(interval);
+  const normalizedOptions = normalizeAllSourceOverlapOptions(options);
+  const key = allSourceOverlapCacheKey(normalizedSymbol, normalizedInterval, normalizedOptions);
+  const stop = refreshHandles.get(key);
+  if (!stop) return false;
+  stop();
+  refreshHandles.delete(key);
+  return true;
+}
+var scheduleConfluenceOverlayRefresh = scheduleAllSourceOverlapRefresh;
+var stopConfluenceOverlayRefresh = stopAllSourceOverlapRefresh;
+function stopLevelsRefresh(symbol, interval) {
+  const { key } = normalizedKey(symbol, interval);
+  const stop = refreshHandles.get(key);
+  if (!stop) return false;
+  stop();
+  refreshHandles.delete(key);
+  return true;
+}
+function clearAllLevelsRefresh() {
+  for (const stop of refreshHandles.values()) stop();
+  refreshHandles.clear();
+}
+function higherTfFor(interval) {
+  return interval === "1d" || interval === "1w" ? "1w" : "1d";
+}
+var CROSS_ASSET_PEERS = {
+  BTC: ["ETH"],
+  ETH: ["BTC"],
+  SOL: ["BTC", "ETH"]
+};
+var fundingHistory = /* @__PURE__ */ new Map();
+var FUNDING_HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1e3;
+function pruneFundingHistory(now = Date.now()) {
+  const cutoff = now - FUNDING_HISTORY_MAX_AGE_MS;
+  for (const [sym, arr] of fundingHistory) {
+    while (arr.length > 0 && (arr[0]?.t ?? 0) < cutoff) arr.shift();
+    if (arr.length === 0) fundingHistory.delete(sym);
+  }
+}
+function pushSnapshot(symbol, funding, oi) {
+  const now = Date.now();
+  pruneFundingHistory(now);
+  const arr = fundingHistory.get(symbol) ?? [];
+  arr.push({ t: now, funding, oi });
+  while (arr.length > 200) arr.shift();
+  fundingHistory.set(symbol, arr);
+}
+function fundingZScore(symbol, current) {
+  const arr = fundingHistory.get(symbol) ?? [];
+  if (arr.length < 5) return 0;
+  const xs = arr.map((s) => s.funding);
+  const mean = xs.reduce((s, x) => s + x, 0) / xs.length;
+  const variance = xs.reduce((s, x) => s + (x - mean) ** 2, 0) / xs.length;
+  const sigma = Math.sqrt(variance) || 1e-9;
+  return (current - mean) / sigma;
+}
+function oiDivergenceState(symbol, currentOi, priceChange) {
+  const arr = fundingHistory.get(symbol) ?? [];
+  if (arr.length < 3) return "neutral";
+  const prevOi = arr[arr.length - 2]?.oi ?? currentOi;
+  const oiDelta = currentOi - prevOi;
+  if (Math.abs(oiDelta) < Math.max(1, prevOi * 1e-3) || priceChange === 0) return "neutral";
+  if (oiDelta > 0 && priceChange > 0) return "long-buildup";
+  if (oiDelta > 0 && priceChange < 0) return "short-buildup";
+  if (oiDelta < 0 && priceChange > 0) return "short-unwind";
+  return "long-unwind";
+}
+async function computeRegimeData(symbol, interval) {
+  symbol = normalizeSymbol(symbol);
+  interval = normalizeInterval(interval);
+  const lookback = intervalToLookbackMs(interval, 400);
+  const candles = await fetchCandles(symbol, interval, lookback);
+  const ohlcv = candlesToOhlcv(candles);
+  const closes = ohlcv.map((b) => b.close);
+  const returns = logReturns(closes);
+  const h = hurstExponent(returns);
+  const reg = regimeFromHurst(h);
+  const vol = garchVolatility(returns);
+  const history = rollingGarchHistory(returns, 50);
+  const garchLabel = garchRegime(vol, history);
+  return {
+    symbol,
+    interval,
+    hurst: h,
+    regimeLabel: reg.label,
+    signalWeightMultiplier: reg.multiplier,
+    garchVolatility: vol,
+    garchRegime: garchLabel
+  };
+}
+async function computeMarketProfileData(symbol, interval) {
+  symbol = normalizeSymbol(symbol);
+  interval = normalizeInterval(interval);
+  const lookback = intervalToLookbackMs(interval, 200);
+  const candles = await fetchCandles(symbol, interval, lookback);
+  const ohlcv = candlesToOhlcv(candles);
+  return marketProfile(ohlcv, 60);
+}
+function computeZonesOnlyFromOhlcv(ohlcv) {
+  if (ohlcv.length < 30) return [];
+  const closes = ohlcv.map((b) => b.close);
+  const currentPrice = closes[closes.length - 1] ?? 0;
+  const returns = logReturns(closes);
+  const vol = garchVolatility(returns);
+  const atr = computeAtr(ohlcv, 14);
+  const pivots = findPivots(ohlcv, 3);
+  const reversalPrices = [
+    ...pivots.highs.map((b) => b.high),
+    ...pivots.lows.map((b) => b.low)
+  ];
+  const lo = Math.min(...closes) * 0.995;
+  const hi = Math.max(...closes) * 1.005;
+  const grid = buildPriceGrid(lo, hi, 200);
+  const weights = recencyWeights(reversalPrices.length, 1.5);
+  const volScale = 1 + Math.min(2, vol * 50);
+  const density = reversalPrices.length ? kde(reversalPrices, grid, void 0, weights, volScale) : grid.map(() => 0);
+  const peaks = kdePeaks(grid, density, 6).slice(0, 12);
+  const raw = [];
+  for (const pk of peaks) {
+    raw.push({
+      price: pk.price,
+      method: "kde-pivot-cluster",
+      kind: pk.price < currentPrice ? "support" : "resistance",
+      strength: Math.min(1, pk.density * 100),
+      validated: false,
+      bounceRate: null,
+      pValue: null,
+      touches: null
+    });
+  }
+  const mp = marketProfile(ohlcv, 60);
+  if (mp.poc) raw.push({ price: mp.poc, method: "market-profile-poc", kind: mp.poc < currentPrice ? "support" : "resistance", strength: 0.8, validated: false, bounceRate: null, pValue: null, touches: null });
+  if (mp.valueAreaHigh) raw.push({ price: mp.valueAreaHigh, method: "value-area-high", kind: "resistance", strength: 0.5, validated: false, bounceRate: null, pValue: null, touches: null });
+  if (mp.valueAreaLow) raw.push({ price: mp.valueAreaLow, method: "value-area-low", kind: "support", strength: 0.5, validated: false, bounceRate: null, pValue: null, touches: null });
+  for (const qb of quantileBands(closes)) raw.push({ price: qb.price, method: "quantile-band", kind: qb.price < currentPrice ? "support" : "resistance", strength: 0.45, validated: false, bounceRate: null, pValue: null, touches: null });
+  for (const high of pivots.highs.slice(-10)) raw.push({ price: high.high, method: "swing-pivot", kind: "resistance", strength: 0.4, validated: false, bounceRate: null, pValue: null, touches: null });
+  for (const low of pivots.lows.slice(-10)) raw.push({ price: low.low, method: "swing-pivot", kind: "support", strength: 0.4, validated: false, bounceRate: null, pValue: null, touches: null });
+  const proximityPct = Math.max(2e-3, Math.min(8e-3, vol * 2));
+  return mergeIntoZones(raw, proximityPct);
+}
+async function computeZonesOnly(symbol, interval) {
+  symbol = normalizeSymbol(symbol);
+  interval = normalizeInterval(interval);
+  const key = `${symbol}|${interval}|zonesOnly`;
+  const result = await zoneOnlyCache.get(key, async () => {
+    const lookback = intervalToLookbackMs(interval, 400);
+    const candles = await fetchCandles(symbol, interval, lookback);
+    return computeZonesOnlyFromOhlcv(candlesToOhlcv(candles));
+  });
+  return result.value;
+}
+function toOverlayData(data) {
+  return {
+    symbol: data.symbol,
+    interval: data.interval,
+    currentPrice: data.currentPrice,
+    zones: data.zones.map((z2) => ({
+      priceLow: z2.priceLow,
+      priceHigh: z2.priceHigh,
+      score: z2.score,
+      kind: z2.kind,
+      preciseEntryPrice: z2.preciseEntryPrice,
+      entryMethod: z2.entryMethod,
+      confidence: z2.confidence,
+      confirmed: z2.confirmed,
+      confirmingTimeframe: z2.confirmingTimeframe,
+      crossAssetConfirmed: z2.crossAssetConfirmed,
+      methods: z2.methods
+    })),
+    levels: data.levels.map((l) => ({
+      price: l.price,
+      method: l.method,
+      kind: l.kind,
+      strength: l.strength,
+      validated: l.validated,
+      isStale: l.isStale
+    })),
+    generatedAt: data.generatedAt
+  };
+}
+var ALL_SOURCE_OVERLAP_CHECKED_METHODS = [
+  "kde-pivot-cluster",
+  "market-profile-poc",
+  "value-area-high",
+  "value-area-low",
+  "swing-pivot",
+  "quantile-band",
+  "large-resting-order",
+  "absorption",
+  "delta-exhaustion",
+  "vwoe",
+  "tape-vwap-inside",
+  "tape-vwap-clamped",
+  "order-flow-confirmation",
+  "absorption-confirmation",
+  "large-resting-order-confirmation",
+  "delta-exhaustion-confirmation",
+  "real-orderbook-wall",
+  "resting-liquidity-wall",
+  "spoof-adjusted-liquidity-wall",
+  "iceberg-detection-level",
+  "liquidity-heatmap-cluster",
+  "bid-stack-level",
+  "ask-stack-level"
+];
+var OVERLAP_METHOD_WEIGHTS = {
+  "kde-pivot-cluster": 1,
+  "market-profile-poc": 1.2,
+  "value-area-high": 0.7,
+  "value-area-low": 0.7,
+  "swing-pivot": 0.6,
+  "quantile-band": 0.8,
+  "large-resting-order": 0.95,
+  "absorption": 1.05,
+  "delta-exhaustion": 0.9,
+  "vwoe": 0.75,
+  "tape-vwap-inside": 0.65,
+  "tape-vwap-clamped": 0.45,
+  "order-flow-confirmation": 0.85,
+  "absorption-confirmation": 1.1,
+  "large-resting-order-confirmation": 1,
+  "delta-exhaustion-confirmation": 0.95,
+  "real-orderbook-wall": 0.9,
+  "resting-liquidity-wall": 1,
+  "spoof-adjusted-liquidity-wall": 0.85,
+  "iceberg-detection-level": 0.95,
+  "liquidity-heatmap-cluster": 0.9,
+  "bid-stack-level": 0.75,
+  "ask-stack-level": 0.75
+};
+function overlapMethodWeight(method) {
+  return OVERLAP_METHOD_WEIGHTS[method] ?? 0.5;
+}
+function strengthRank(tier) {
+  if (tier === "elite") return 3;
+  if (tier === "strong") return 2;
+  return 1;
+}
+function overlapTier(score, methods, sources, origins) {
+  if (score >= 3.25 && (methods >= 3 || origins >= 3) && sources >= 2) return "elite";
+  if (score >= 1.55 && (methods >= 2 || sources >= 2 || origins >= 2)) return "strong";
+  return "developing";
+}
+function autoOriginId(candidate) {
+  const bucket = Math.round(candidate.price * 100) / 100;
+  return `${candidate.source}:${candidate.method}:${bucket}`;
+}
+function pushOverlapCandidate(out, candidate) {
+  if (!candidate) return;
+  if (!Number.isFinite(candidate.price) || candidate.price <= 0) return;
+  if (!Number.isFinite(candidate.strength) || candidate.strength <= 0) return;
+  out.push({
+    ...candidate,
+    originId: candidate.originId ?? autoOriginId(candidate),
+    confidence: Math.max(0.05, Math.min(1, candidate.confidence)),
+    strength: Math.max(0.01, candidate.strength)
+  });
+}
+function structuralCandidatesFromOhlcv(ohlcv, source) {
+  if (ohlcv.length < 30) return [];
+  const closes = ohlcv.map((b) => b.close);
+  const currentPrice = closes[closes.length - 1] ?? 0;
+  const returns = logReturns(closes);
+  const vol = garchVolatility(returns);
+  const pivots = findPivots(ohlcv, 3);
+  const reversalPrices = [...pivots.highs.map((b) => b.high), ...pivots.lows.map((b) => b.low)];
+  const lo = Math.min(...closes) * 0.995;
+  const hi = Math.max(...closes) * 1.005;
+  const grid = buildPriceGrid(lo, hi, 200);
+  const weights = recencyWeights(reversalPrices.length, 1.5);
+  const volScale = 1 + Math.min(2, vol * 50);
+  const density = reversalPrices.length ? kde(reversalPrices, grid, void 0, weights, volScale) : grid.map(() => 0);
+  const peaks = kdePeaks(grid, density, 6).slice(0, 12);
+  const out = [];
+  for (const pk of peaks) {
+    pushOverlapCandidate(out, {
+      price: pk.price,
+      method: "kde-pivot-cluster",
+      kind: pk.price < currentPrice ? "support" : "resistance",
+      strength: Math.min(1, pk.density * 100),
+      source,
+      confidence: 0.7
+    });
+  }
+  const mp = marketProfile(ohlcv, 60);
+  if (mp.poc) pushOverlapCandidate(out, { price: mp.poc, method: "market-profile-poc", kind: mp.poc < currentPrice ? "support" : "resistance", strength: 0.9, source, confidence: 0.85 });
+  if (mp.valueAreaHigh) pushOverlapCandidate(out, { price: mp.valueAreaHigh, method: "value-area-high", kind: "resistance", strength: 0.6, source, confidence: 0.7 });
+  if (mp.valueAreaLow) pushOverlapCandidate(out, { price: mp.valueAreaLow, method: "value-area-low", kind: "support", strength: 0.6, source, confidence: 0.7 });
+  for (const qb of quantileBands(closes)) {
+    pushOverlapCandidate(out, {
+      price: qb.price,
+      method: "quantile-band",
+      kind: qb.price < currentPrice ? "support" : "resistance",
+      strength: 0.55,
+      source,
+      confidence: 0.65
+    });
+  }
+  for (const high of pivots.highs.slice(-10)) pushOverlapCandidate(out, { price: high.high, method: "swing-pivot", kind: "resistance", strength: 0.5, source, confidence: 0.6 });
+  for (const low of pivots.lows.slice(-10)) pushOverlapCandidate(out, { price: low.low, method: "swing-pivot", kind: "support", strength: 0.5, source, confidence: 0.6 });
+  return out;
+}
+var bookMemory = /* @__PURE__ */ new Map();
+function priceKey(price, currentPrice) {
+  const step = Math.max(currentPrice * 25e-5, 1e-8);
+  return (Math.round(price / step) * step).toFixed(8);
+}
+function median(xs) {
+  if (xs.length === 0) return 0;
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
+}
+function levelsNear(candidates, price, pct) {
+  const ref = Math.max(1, Math.abs(price));
+  return candidates.filter((c) => Math.abs(c.price - price) / ref <= pct);
+}
+function deriveBookCandidates(symbol, book, currentPrice) {
+  const out = [];
+  const bids = book.levels[0].slice(0, 30).map((x) => ({ px: Number(x.px), sz: Number(x.sz), n: x.n, side: "bid" })).filter((x) => Number.isFinite(x.px) && x.px > 0 && x.sz > 0);
+  const asks = book.levels[1].slice(0, 30).map((x) => ({ px: Number(x.px), sz: Number(x.sz), n: x.n, side: "ask" })).filter((x) => Number.isFinite(x.px) && x.px > 0 && x.sz > 0);
+  const all = [...bids, ...asks];
+  if (all.length === 0) return out;
+  const sizes = all.map((x) => x.sz);
+  const med = Math.max(median(sizes), 1e-9);
+  const now = Date.now();
+  const memory = bookMemory.get(symbol) ?? /* @__PURE__ */ new Map();
+  for (const lvl of all) {
+    const key = priceKey(lvl.px, currentPrice);
+    const prev = memory.get(key);
+    memory.set(key, {
+      seen: Math.min(20, (prev?.seen ?? 0) + 1),
+      lastSeen: now,
+      maxSize: Math.max(prev?.maxSize ?? 0, lvl.sz),
+      side: lvl.side
+    });
+  }
+  for (const [key, value] of memory) {
+    if (now - value.lastSeen > 12e4) memory.delete(key);
+  }
+  bookMemory.set(symbol, memory);
+  const topBySize = [...all].sort((a, b) => b.sz - a.sz).slice(0, 8);
+  for (const lvl of topBySize) {
+    const conf = Math.min(1, lvl.sz / (med * 4));
+    const kind = lvl.side === "bid" ? "support" : "resistance";
+    const key = priceKey(lvl.px, currentPrice);
+    const seen = memory.get(key)?.seen ?? 1;
+    if (lvl.sz >= med * 1.8) {
+      const originId = `book-wall:${lvl.side}:${key}`;
+      pushOverlapCandidate(out, { price: lvl.px, method: "real-orderbook-wall", kind, strength: 0.8 + conf * 0.35, source: "live-book", confidence: conf, originId });
+      pushOverlapCandidate(out, { price: lvl.px, method: "large-resting-order", kind, strength: 0.75 + conf * 0.3, source: "live-book", confidence: conf, originId });
+    }
+    if (seen >= 2 && lvl.sz >= med * 1.25) {
+      const persistConf = Math.min(1, seen / 5) * Math.min(1, lvl.sz / (med * 3));
+      const originId = `book-wall:${lvl.side}:${key}`;
+      pushOverlapCandidate(out, { price: lvl.px, method: "resting-liquidity-wall", kind, strength: 0.85, source: "live-book", confidence: persistConf, originId });
+      pushOverlapCandidate(out, { price: lvl.px, method: "spoof-adjusted-liquidity-wall", kind, strength: 0.75, source: "live-book", confidence: persistConf, originId });
+    } else if (lvl.n >= 2 && lvl.sz >= med * 2.5) {
+      pushOverlapCandidate(out, { price: lvl.px, method: "spoof-adjusted-liquidity-wall", kind, strength: 0.55, source: "live-book", confidence: Math.min(0.65, conf), originId: `book-wall:${lvl.side}:${key}` });
+    }
+  }
+  for (const [side, arr, method, kind] of [
+    ["bid", bids, "bid-stack-level", "support"],
+    ["ask", asks, "ask-stack-level", "resistance"]
+  ]) {
+    const top = [...arr].sort((a, b) => b.sz - a.sz).slice(0, 5);
+    for (const lvl of top) {
+      if (lvl.sz < med * 1.2) continue;
+      pushOverlapCandidate(out, { price: lvl.px, method, kind, strength: 0.6 + Math.min(0.35, lvl.sz / (med * 10)), source: "live-book", confidence: Math.min(1, lvl.sz / (med * 3)), originId: `book-wall:${lvl.side}:${priceKey(lvl.px, currentPrice)}` });
+    }
+    for (const lvl of top) {
+      const local = arr.filter((x) => Math.abs(x.px - lvl.px) / Math.max(1, lvl.px) <= 15e-4);
+      const localSize = local.reduce((sum, x) => sum + x.sz, 0);
+      if (local.length >= 2 && localSize >= med * 3) {
+        const px = local.reduce((sum, x) => sum + x.px * x.sz, 0) / localSize;
+        pushOverlapCandidate(out, { price: px, method: "liquidity-heatmap-cluster", kind, strength: 0.7 + Math.min(0.35, localSize / (med * 12)), source: "live-book", confidence: Math.min(1, localSize / (med * 6)), originId: `book-cluster:${side}:${priceKey(px, currentPrice)}` });
+      }
+    }
+    void side;
+  }
+  return out;
+}
+function tradeVwap(trades, low, high) {
+  let pxVol = 0;
+  let vol = 0;
+  for (const t of trades) {
+    const px = Number(t.px);
+    if (px < low || px > high) continue;
+    const sz = Number(t.sz);
+    pxVol += px * sz;
+    vol += sz;
+  }
+  if (vol <= 0) return null;
+  return { price: pxVol / vol, method: "tape-vwap-inside", confidence: Math.min(1, vol / 100) };
+}
+function clampedTradeVwap(trades, low, high) {
+  let pxVol = 0;
+  let vol = 0;
+  for (const t of trades.slice(-200)) {
+    const sz = Number(t.sz);
+    pxVol += Math.min(Math.max(Number(t.px), low), high) * sz;
+    vol += sz;
+  }
+  if (vol <= 0) return null;
+  return { price: pxVol / vol, method: "tape-vwap-clamped", confidence: Math.min(0.7, vol / 150) };
+}
+function deriveTradeCandidates(trades, ohlcv, currentPrice, structural) {
+  const out = [];
+  if (trades.length === 0) return out;
+  const structuralPrices = structural.map((c) => c.price).filter((p) => Number.isFinite(p) && p > 0);
+  const low = structuralPrices.length ? Math.min(...structuralPrices) : currentPrice * 0.98;
+  const high = structuralPrices.length ? Math.max(...structuralPrices) : currentPrice * 1.02;
+  const boundedLow = Math.max(currentPrice * 0.85, low);
+  const boundedHigh = Math.min(currentPrice * 1.15, high);
+  for (const entry of [
+    absorptionEntry(trades, boundedLow, boundedHigh),
+    deltaExhaustion(ohlcv.slice(-80), boundedLow, boundedHigh),
+    vwoe(trades, boundedLow, boundedHigh),
+    tradeVwap(trades, boundedLow, boundedHigh),
+    clampedTradeVwap(trades, boundedLow, boundedHigh)
+  ]) {
+    if (!entry) continue;
+    const method = entry.method;
+    pushOverlapCandidate(out, {
+      price: entry.price,
+      method,
+      kind: entry.price < currentPrice ? "support" : "resistance",
+      strength: 0.55 + entry.confidence * 0.55,
+      source: "live-trades",
+      confidence: entry.confidence
+    });
+  }
+  const buckets = /* @__PURE__ */ new Map();
+  const step = Math.max(currentPrice * 25e-5, 1e-8);
+  for (const t of trades.slice(-500)) {
+    const px = Number(t.px);
+    const sz = Number(t.sz);
+    if (!Number.isFinite(px) || !Number.isFinite(sz) || sz <= 0) continue;
+    const key = (Math.round(px / step) * step).toFixed(8);
+    const b = buckets.get(key) ?? { priceVol: 0, vol: 0, count: 0 };
+    b.priceVol += px * sz;
+    b.vol += sz;
+    b.count += 1;
+    buckets.set(key, b);
+  }
+  const bucketArr = [...buckets.values()].filter((b) => b.count >= 4).sort((a, b) => b.vol * b.count - a.vol * a.count).slice(0, 4);
+  const medianVol = Math.max(median([...buckets.values()].map((b) => b.vol)), 1e-9);
+  for (const b of bucketArr) {
+    if (b.vol < medianVol * 1.5) continue;
+    const px = b.priceVol / b.vol;
+    pushOverlapCandidate(out, {
+      price: px,
+      method: "iceberg-detection-level",
+      kind: px < currentPrice ? "support" : "resistance",
+      strength: 0.7 + Math.min(0.35, b.count / 25),
+      source: "live-trades",
+      confidence: Math.min(1, b.vol / medianVol / 6)
+    });
+  }
+  return out;
+}
+function deriveConfirmationCandidates(symbol, book, trades, live, structural, ohlcv, currentPrice) {
+  const out = [];
+  const lastVol = Math.max(1, ohlcv.slice(-50).reduce((sum, b) => sum + b.volume, 0) / Math.max(1, Math.min(50, ohlcv.length)));
+  const obi = computeObi(book, 10);
+  const vpin = computeVpin(trades, Math.max(lastVol * 0.05, 1), 30);
+  recordOrderFlow(symbol, obi, vpin);
+  const sustained = sustainedOrderFlow(symbol);
+  const bidHeavy = sustained.samples >= 3 && (sustained.fracObiBidHeavy >= 0.34 || obi > 0.18);
+  const askHeavy = sustained.samples >= 3 && (sustained.fracObiAskHeavy >= 0.34 || obi < -0.18);
+  const bestBid = book.levels[0][0] ? Number(book.levels[0][0].px) : currentPrice;
+  const bestAsk = book.levels[1][0] ? Number(book.levels[1][0].px) : currentPrice;
+  if (bidHeavy) pushOverlapCandidate(out, { price: bestBid, method: "order-flow-confirmation", kind: "support", strength: 0.65 + Math.min(0.35, Math.abs(obi)), source: "confirmation", confidence: Math.min(1, Math.abs(obi) / 0.35) });
+  if (askHeavy) pushOverlapCandidate(out, { price: bestAsk, method: "order-flow-confirmation", kind: "resistance", strength: 0.65 + Math.min(0.35, Math.abs(obi)), source: "confirmation", confidence: Math.min(1, Math.abs(obi) / 0.35) });
+  for (const c of live) {
+    const nearStructural = levelsNear(structural, c.price, 25e-4).length > 0;
+    if (!nearStructural) continue;
+    if (c.method === "absorption") pushOverlapCandidate(out, { ...c, method: "absorption-confirmation", source: "confirmation", strength: c.strength + 0.15 });
+    if (c.method === "large-resting-order") pushOverlapCandidate(out, { ...c, method: "large-resting-order-confirmation", source: "confirmation", strength: c.strength + 0.1 });
+    if (c.method === "delta-exhaustion") pushOverlapCandidate(out, { ...c, method: "delta-exhaustion-confirmation", source: "confirmation", strength: c.strength + 0.1 });
+  }
+  return out;
+}
+function kindForCluster(candidates) {
+  const supports = candidates.filter((c) => c.kind === "support").length;
+  const resistances = candidates.filter((c) => c.kind === "resistance").length;
+  return supports > resistances ? "support" : resistances > supports ? "resistance" : "neutral";
+}
+function buildOverlapOnlyLevels(candidates, currentPrice, atr, options) {
+  const tolerancePct = Math.max(75e-5, Math.min(35e-4, atr / Math.max(1, currentPrice) * 0.8));
+  const sorted = [...candidates].sort((a, b) => a.price - b.price);
+  const clusters = [];
+  let cur = [];
+  for (const c of sorted) {
+    if (cur.length === 0) {
+      cur = [c];
+      continue;
+    }
+    const ref = cur.reduce((sum, x) => sum + x.price, 0) / cur.length;
+    if (Math.abs(c.price - ref) / Math.max(1, ref) <= tolerancePct) cur.push(c);
+    else {
+      clusters.push(cur);
+      cur = [c];
+    }
+  }
+  if (cur.length) clusters.push(cur);
+  const minRank = strengthRank(options.minStrength);
+  const levels = clusters.map((cluster) => {
+    const methods = Array.from(new Set(cluster.map((c) => c.method))).sort();
+    const sources = Array.from(new Set(cluster.map((c) => c.source))).sort();
+    const origins = Array.from(new Set(cluster.map((c) => c.originId))).sort();
+    if (origins.length < 2) return null;
+    const weighted = cluster.reduce((sum, c) => sum + c.strength * c.confidence * overlapMethodWeight(c.method), 0);
+    const sourceBonus = Math.min(0.45, Math.max(0, sources.length - 1) * 0.15);
+    const methodBonus = Math.min(0.6, Math.max(0, methods.length - 1) * 0.12);
+    const originBonus = Math.min(0.45, Math.max(0, origins.length - 2) * 0.1);
+    const strength = weighted + sourceBonus + methodBonus + originBonus;
+    const overlapStrength = overlapTier(strength, methods.length, sources.length, origins.length);
+    if (strengthRank(overlapStrength) < minRank) return null;
+    const totalWeight = cluster.reduce((sum, c) => sum + Math.max(0.01, c.strength * c.confidence), 0);
+    const price = cluster.reduce((sum, c) => sum + c.price * Math.max(0.01, c.strength * c.confidence), 0) / totalWeight;
+    return {
+      price,
+      priceLow: Math.min(...cluster.map((c) => c.price)),
+      priceHigh: Math.max(...cluster.map((c) => c.price)),
+      kind: kindForCluster(cluster),
+      strength,
+      overlapStrength,
+      overlapCount: cluster.length,
+      independentOverlapCount: origins.length,
+      methods,
+      sources,
+      origins,
+      candidates: cluster.sort((a, b) => b.strength * b.confidence - a.strength * a.confidence)
+    };
+  }).filter((x) => Boolean(x)).sort((a, b) => b.strength - a.strength);
+  const kept = [];
+  for (const level of levels) {
+    const duplicate = kept.some((k) => k.kind === level.kind && Math.abs(k.price - level.price) / Math.max(1, level.price) <= tolerancePct * 0.7);
+    if (!duplicate) kept.push(level);
+    if (kept.length >= options.limit) break;
+  }
+  return kept;
+}
+function emptyBook(symbol) {
+  return { coin: symbol, time: Date.now(), levels: [[], []] };
+}
+function skippedLiveStatus() {
+  return { status: "skipped", latencyMs: 0 };
+}
+async function withForegroundBudget(promise, budgetMs, fallback2) {
+  const startedAt = Date.now();
+  const handled = promise.then((value) => ({ kind: "ok", value })).catch((err) => ({ kind: "error", error: err instanceof Error ? err.message : String(err) }));
+  const timer = new Promise((resolve) => {
+    setTimeout(() => resolve({ kind: "timeout" }), budgetMs);
+  });
+  const result = await Promise.race([handled, timer]);
+  const latencyMs = Date.now() - startedAt;
+  if (result.kind === "ok") return { value: result.value, detail: { status: "ok", latencyMs } };
+  if (result.kind === "error") return { value: fallback2, detail: { status: "error", latencyMs, error: result.error } };
+  return { value: fallback2, detail: { status: "timeout", latencyMs } };
+}
+async function computeAllSourceOverlapData(symbol, interval = "4h", options = {}) {
+  symbol = normalizeSymbol(symbol);
+  interval = normalizeInterval(interval);
+  const normalizedOptions = normalizeAllSourceOverlapOptions(options);
+  const bookPromise = normalizedOptions.includeLive ? fetchL2Book(symbol) : Promise.resolve(emptyBook(symbol));
+  const tradesPromise = normalizedOptions.includeLive ? fetchTrades(symbol) : Promise.resolve([]);
+  const [oneHourCandles, fourHourCandles] = await Promise.all([
+    fetchCandles(symbol, "1h", intervalToLookbackMs("1h", 420)),
+    fetchCandles(symbol, "4h", intervalToLookbackMs("4h", 420))
+  ]);
+  const oneHourOhlcv = candlesToOhlcv(oneHourCandles);
+  const fourHourOhlcv = candlesToOhlcv(fourHourCandles);
+  const currentPrice = oneHourOhlcv[oneHourOhlcv.length - 1]?.close ?? fourHourOhlcv[fourHourOhlcv.length - 1]?.close ?? 0;
+  if (currentPrice <= 0) throw new Error(`No data for ${symbol}`);
+  const structural = [
+    ...structuralCandidatesFromOhlcv(oneHourOhlcv, "1h"),
+    ...structuralCandidatesFromOhlcv(fourHourOhlcv, "4h")
+  ];
+  const [{ value: book, detail: bookStatus }, { value: trades, detail: tradesStatus }] = normalizedOptions.includeLive ? await Promise.all([
+    withForegroundBudget(bookPromise, normalizedOptions.liveBudgetMs, emptyBook(symbol)),
+    withForegroundBudget(tradesPromise, normalizedOptions.liveBudgetMs, [])
+  ]) : [
+    { value: emptyBook(symbol), detail: skippedLiveStatus() },
+    { value: [], detail: skippedLiveStatus() }
+  ];
+  const liveBook = normalizedOptions.includeLive && bookStatus.status === "ok" ? deriveBookCandidates(symbol, book, currentPrice) : [];
+  const liveTrades = normalizedOptions.includeLive && tradesStatus.status === "ok" ? deriveTradeCandidates(trades, oneHourOhlcv, currentPrice, structural) : [];
+  const live = [...liveBook, ...liveTrades];
+  const confirmations = normalizedOptions.includeLive && bookStatus.status === "ok" && tradesStatus.status === "ok" ? deriveConfirmationCandidates(symbol, book, trades, live, structural, oneHourOhlcv, currentPrice) : [];
+  const atr = Math.max(computeAtr(oneHourOhlcv, 14), computeAtr(fourHourOhlcv, 14));
+  const candidates = [...structural, ...live, ...confirmations].filter((c) => ALL_SOURCE_OVERLAP_CHECKED_METHODS.includes(c.method));
+  return {
+    symbol,
+    interval,
+    displayMode: "all-source-overlap-only",
+    currentPrice,
+    checkedMethods: [...ALL_SOURCE_OVERLAP_CHECKED_METHODS],
+    levels: buildOverlapOnlyLevels(candidates, currentPrice, atr, normalizedOptions),
+    liveStatus: {
+      includeLive: normalizedOptions.includeLive,
+      foregroundBudgetMs: normalizedOptions.liveBudgetMs,
+      book: bookStatus,
+      trades: tradesStatus
+    },
+    candidateCounts: {
+      structural: structural.length,
+      liveBook: liveBook.length,
+      liveTrades: liveTrades.length,
+      confirmations: confirmations.length,
+      total: candidates.length
+    },
+    generatedAt: Date.now()
+  };
+}
+async function computeLevelsData(symbol, interval, options = {}) {
+  const includeAi = options.includeAi ?? true;
+  const includeCrossPairReport = options.includeCrossPairReport ?? true;
+  symbol = normalizeSymbol(symbol);
+  interval = normalizeInterval(interval);
+  const lookback = intervalToLookbackMs(interval, 500);
+  const higherTf = higherTfFor(interval);
+  const peers = CROSS_ASSET_PEERS[symbol] ?? [];
+  const [candles, book, trades, higherZones, peerZonesArr] = await Promise.all([
+    fetchCandles(symbol, interval, lookback),
+    fetchL2Book(symbol).catch(() => ({ coin: symbol, time: Date.now(), levels: [[], []] })),
+    fetchTrades(symbol).catch(() => []),
+    higherTf ? computeZonesOnly(symbol, higherTf).catch(() => []) : Promise.resolve([]),
+    Promise.all(peers.map(async (p) => {
+      try {
+        const lb = intervalToLookbackMs(interval, 400);
+        const cs = await fetchCandles(p, interval, lb);
+        const ohlcvP = candlesToOhlcv(cs);
+        const peerPrice = ohlcvP[ohlcvP.length - 1]?.close ?? 0;
+        const zones2 = computeZonesOnlyFromOhlcv(ohlcvP);
+        return { peer: p, peerPrice, zones: zones2 };
+      } catch {
+        return { peer: p, peerPrice: 0, zones: [] };
+      }
+    }))
+  ]);
+  const ohlcv = candlesToOhlcv(candles);
+  if (ohlcv.length === 0) throw new Error(`No data for ${symbol}`);
+  const closes = ohlcv.map((b) => b.close);
+  const currentPrice = closes[closes.length - 1] ?? 0;
+  const returns = logReturns(closes);
+  const h = hurstExponent(returns);
+  const reg = regimeFromHurst(h);
+  const vol = garchVolatility(returns);
+  const history = rollingGarchHistory(returns, 50);
+  const garchLabel = garchRegime(vol, history);
+  const regime = {
+    symbol,
+    interval,
+    hurst: h,
+    regimeLabel: reg.label,
+    signalWeightMultiplier: reg.multiplier,
+    garchVolatility: vol,
+    garchRegime: garchLabel
+  };
+  const atr = computeAtr(ohlcv, 14);
+  const pivots = findPivots(ohlcv, 3);
+  const timeToIdx = /* @__PURE__ */ new Map();
+  for (let i = 0; i < ohlcv.length; i++) timeToIdx.set(ohlcv[i].time, i);
+  const idxOf = (b) => timeToIdx.get(b.time) ?? -1;
+  const chronoPivots = [
+    ...pivots.highs.map((b) => ({ idx: idxOf(b), price: b.high, kind: "high" })),
+    ...pivots.lows.map((b) => ({ idx: idxOf(b), price: b.low, kind: "low" }))
+  ].sort((a, b) => a.idx - b.idx);
+  const reversalPrices = chronoPivots.map((p) => p.price);
+  const lo = Math.min(...closes) * 0.995;
+  const hi = Math.max(...closes) * 1.005;
+  const grid = buildPriceGrid(lo, hi, 200);
+  const pivotWeights = recencyWeights(reversalPrices.length, 1.5);
+  const volScale = 1 + Math.min(2, vol * 50);
+  const density = reversalPrices.length > 0 ? kde(reversalPrices, grid, void 0, pivotWeights, volScale) : grid.map(() => 0);
+  const kdePoints = grid.map((p, i) => ({ price: p, density: density[i] ?? 0 }));
+  const peaks = kdePeaks(grid, density, 6).slice(0, 12);
+  function detectionIdxFor(price, tol) {
+    let lastIdx = -1;
+    for (const p of chronoPivots) {
+      if (Math.abs(p.price - price) <= tol) lastIdx = p.idx;
+    }
+    if (lastIdx < 0) lastIdx = Math.floor(ohlcv.length * 0.7);
+    return lastIdx;
+  }
+  const mp = marketProfile(ohlcv, 60);
+  const tolerance = Math.max((hi - lo) * 3e-3, atr * 0.25);
+  const STALE_BARS = 200;
+  const baseOpts = { atr, staleBars: STALE_BARS };
+  const rawLevels = [];
+  const gate = (v) => v.touches >= 3 && v.posteriorBounceRate >= 0.6 && v.bounceRate >= 0.6 && v.pValue < 0.1 && !v.isStale;
+  const gateLight = (v) => v.touches >= 2 && v.posteriorBounceRate >= 0.6 && v.bounceRate >= 0.6 && v.pValue < 0.15 && !v.isStale;
+  function pushLevel(price, method, strength, detectionIndex, isLight) {
+    const v = validateLevel(ohlcv, price, tolerance, 5, 2, { ...baseOpts, detectionIndex });
+    rawLevels.push({
+      price,
+      method,
+      kind: price < currentPrice ? "support" : "resistance",
+      strength,
+      validated: (isLight ? gateLight : gate)(v),
+      bounceRate: v.touches > 0 ? v.posteriorBounceRate : null,
+      pValue: v.touches > 0 ? v.pValue : null,
+      touches: v.touches,
+      lastTouchAge: v.lastTouchAge,
+      isStale: v.isStale
+    });
+  }
+  for (const pk of peaks) {
+    pushLevel(
+      pk.price,
+      "kde-pivot-cluster",
+      Math.min(1, pk.density * 100) * reg.multiplier,
+      detectionIdxFor(pk.price, tolerance),
+      false
+    );
+  }
+  if (mp.poc) {
+    pushLevel(mp.poc, "market-profile-poc", 0.9 * reg.multiplier, Math.floor(ohlcv.length * 0.7), false);
+  }
+  for (const [price, name] of [
+    [mp.valueAreaHigh, "value-area-high"],
+    [mp.valueAreaLow, "value-area-low"]
+  ]) {
+    if (!price) continue;
+    pushLevel(price, name, 0.6 * reg.multiplier, Math.floor(ohlcv.length * 0.7), false);
+  }
+  const qbands = quantileBands(closes);
+  for (const qb of qbands) {
+    pushLevel(qb.price, "quantile-band", 0.55 * reg.multiplier, Math.floor(ohlcv.length * 0.7), true);
+  }
+  for (const high of pivots.highs.slice(-6)) {
+    pushLevel(high.high, "swing-pivot", 0.5 * reg.multiplier, idxOf(high), true);
+  }
+  for (const low of pivots.lows.slice(-6)) {
+    pushLevel(low.low, "swing-pivot", 0.5 * reg.multiplier, idxOf(low), true);
+  }
+  const proximityPct = Math.max(1e-3, Math.min(5e-3, vol * 1.5));
+  const rawZones = mergeIntoZones(rawLevels, proximityPct);
+  const obi = computeObi(book, 10);
+  const lastVol = ohlcv.slice(-50).reduce((s, b) => s + b.volume, 0) / 50;
+  const vpin = computeVpin(trades, Math.max(lastVol * 0.05, 1), 30);
+  recordOrderFlow(symbol, obi, vpin);
+  const sustained = sustainedOrderFlow(symbol);
+  const sustainedThreshold = 0.4;
+  const sustainedSamples = sustained.samples >= 5;
+  const sustainedBidHeavy = sustainedSamples && sustained.fracObiBidHeavy >= sustainedThreshold;
+  const sustainedAskHeavy = sustainedSamples && sustained.fracObiAskHeavy >= sustainedThreshold;
+  function orderFlowAdjust(zMid, zKind) {
+    const proximity = Math.abs(zMid - currentPrice) / Math.max(currentPrice, 1);
+    if (proximity > 0.02) return 0;
+    const proxFactor = 1 - proximity / 0.02;
+    const meanObi = sustained.meanObi;
+    const meanVpin = sustained.meanVpin;
+    const agree = zKind === "support" && sustainedBidHeavy || zKind === "resistance" && sustainedAskHeavy ? Math.min(1, Math.abs(meanObi) / 0.3) : 0;
+    const disagree = zKind === "support" && sustainedAskHeavy || zKind === "resistance" && sustainedBidHeavy ? Math.min(1, Math.abs(meanObi) / 0.3) : 0;
+    const vpinAmp = meanVpin > 0.25 ? 1 + Math.min(1, (meanVpin - 0.25) / 0.25) : 1;
+    const bonus = proxFactor * agree * vpinAmp * 0.8;
+    const penalty = proxFactor * disagree * vpinAmp * 0.6;
+    return bonus - penalty;
+  }
+  function crossAssetMatch(zMid, zKind) {
+    if (peerZonesArr.length === 0) return false;
+    const ourPct = (zMid - currentPrice) / Math.max(currentPrice, 1);
+    for (const peer of peerZonesArr) {
+      if (peer.peerPrice <= 0) continue;
+      for (const pz of peer.zones) {
+        if (pz.kind !== zKind) continue;
+        const peerMid = (pz.priceLow + pz.priceHigh) / 2;
+        const peerPct = (peerMid - peer.peerPrice) / Math.max(peer.peerPrice, 1);
+        if (Math.abs(ourPct - peerPct) <= 5e-3) return true;
+      }
+    }
+    return false;
+  }
+  const overlapPad = Math.max(currentPrice * 2e-3, atr * 0.5);
+  function overlapsHigher(zLow, zHigh) {
+    for (const hz of higherZones) {
+      if (hz.priceLow - overlapPad <= zHigh && hz.priceHigh + overlapPad >= zLow) return hz;
+    }
+    return null;
+  }
+  function zoneIsStale(z2) {
+    const contributing = rawLevels.filter(
+      (l) => l.price >= z2.priceLow - tolerance && l.price <= z2.priceHigh + tolerance
+    );
+    if (contributing.length === 0) return true;
+    return contributing.every((l) => l.isStale);
+  }
+  const zones = rawZones.filter((z2) => !zoneIsStale(z2)).map((z2) => {
+    const mid = (z2.priceLow + z2.priceHigh) / 2;
+    const ofAdj = orderFlowAdjust(mid, z2.kind);
+    const higher = overlapsHigher(z2.priceLow, z2.priceHigh);
+    const xAsset = crossAssetMatch(mid, z2.kind);
+    const tfBonus = higher ? z2.score * 0.3 : 0;
+    const xaBonus = xAsset ? z2.score * 0.2 : 0;
+    return {
+      ...z2,
+      score: z2.score + ofAdj + tfBonus + xaBonus,
+      confirmingTimeframe: higher ? higherTf : null,
+      crossAssetConfirmed: xAsset
+    };
+  }).filter((z2) => z2.score > 0.3).sort((a, b) => b.score - a.score).slice(0, 8).map((z2) => {
+    const mid = (z2.priceLow + z2.priceHigh) / 2;
+    const entry = pickPrecisionEntry(ohlcv, trades, book, z2.priceLow, z2.priceHigh, mid);
+    const confirmed = confirmZone(ohlcv, z2.priceLow, z2.priceHigh, z2.kind);
+    const posteriorBounceRate = z2.bounceRate;
+    const supports = (confirmed ? 1 : 0) + (z2.confirmingTimeframe ? 1 : 0) + (z2.crossAssetConfirmed ? 1 : 0);
+    const confidence = supports >= 2 ? "high" : supports === 1 ? "medium" : "low";
+    return {
+      priceLow: z2.priceLow,
+      priceHigh: z2.priceHigh,
+      score: z2.score,
+      kind: z2.kind,
+      methods: z2.methods,
+      preciseEntryPrice: entry.price,
+      entryMethod: entry.method,
+      bounceRate: z2.bounceRate,
+      pValue: z2.pValue,
+      posteriorBounceRate,
+      confirmed,
+      confirmingTimeframe: z2.confirmingTimeframe,
+      crossAssetConfirmed: z2.crossAssetConfirmed,
+      confidence
+    };
+  });
+  let funding = 0;
+  let openInterest = 0;
+  try {
+    const [meta, ctxs] = await fetchMetaAndCtxs();
+    const idx = meta.universe.findIndex((u) => u.name === symbol);
+    if (idx >= 0 && ctxs[idx]) {
+      funding = parseFloat(ctxs[idx].funding) || 0;
+      openInterest = parseFloat(ctxs[idx].openInterest) || 0;
+    }
+  } catch {
+  }
+  pushSnapshot(symbol, funding, openInterest);
+  const fundingZ = fundingZScore(symbol, funding);
+  const cvd = trades.reduce((s, t) => {
+    const sz = parseFloat(t.sz) || 0;
+    return s + (t.side === "B" ? sz : -sz);
+  }, 0);
+  const recentBars = ohlcv.slice(-20);
+  const priceChange = recentBars.length ? (recentBars[recentBars.length - 1]?.close ?? currentPrice) - (recentBars[0]?.close ?? currentPrice) : 0;
+  const cvdDivergence = Math.sign(cvd) !== 0 && Math.sign(priceChange) !== 0 && Math.sign(cvd) !== Math.sign(priceChange);
+  const signals = [
+    { name: "Hurst", value: h, label: reg.label, direction: h < 0.45 ? "weakening" : h > 0.55 ? "strengthening" : "neutral" },
+    { name: "GARCH Vol", value: vol, label: garchLabel, direction: garchLabel === "high" ? "strengthening" : garchLabel === "low" ? "weakening" : "neutral" },
+    { name: "VPIN", value: vpin, label: vpin > 0.4 ? "toxic" : vpin > 0.25 ? "elevated" : "calm", direction: vpin > 0.4 ? "strengthening" : "neutral" },
+    { name: "OBI", value: obi, label: obi > 0.15 ? "bid-heavy" : obi < -0.15 ? "ask-heavy" : "balanced", direction: Math.abs(obi) > 0.15 ? "strengthening" : "neutral" },
+    {
+      name: "Funding",
+      value: funding,
+      label: Math.abs(fundingZ) >= 2 ? `extreme (z=${fundingZ.toFixed(2)})` : Math.abs(fundingZ) >= 1 ? `elevated (z=${fundingZ.toFixed(2)})` : funding > 1e-4 ? "longs paying" : funding < -1e-4 ? "shorts paying" : "neutral",
+      direction: Math.abs(fundingZ) >= 1 ? "strengthening" : "neutral"
+    },
+    {
+      name: "Open Interest",
+      value: openInterest,
+      label: openInterest > 0 ? oiDivergenceState(symbol, openInterest, priceChange) : "n/a",
+      direction: openInterest > 0 && oiDivergenceState(symbol, openInterest, priceChange) !== "neutral" ? "strengthening" : "neutral"
+    },
+    { name: "CVD", value: cvd, label: cvdDivergence ? "divergent vs price" : cvd > 0 ? "buy-pressure" : cvd < 0 ? "sell-pressure" : "flat", direction: cvdDivergence ? "strengthening" : "neutral" }
+  ];
+  const divergences = findDivergences(ohlcv);
+  const tiers = [
+    { lev: 5, density: 0.25 },
+    { lev: 10, density: 0.45 },
+    { lev: 25, density: 0.7 },
+    { lev: 50, density: 0.55 },
+    { lev: 100, density: 0.35 }
+  ];
+  const liquidations = tiers.flatMap((t) => [
+    { price: currentPrice * (1 + 1 / t.lev), density: t.density, leverage: t.lev },
+    { price: currentPrice * (1 - 1 / t.lev), density: t.density, leverage: t.lev }
+  ]);
+  let crossPair;
+  if (includeCrossPairReport) {
+    try {
+      const xp = await computeCrossPairZScores();
+      crossPair = xp.map((x) => ({ pair: x.pair, zScore: x.zScore, signal: x.signal }));
+    } catch {
+      crossPair = [];
+    }
+  } else {
+    crossPair = [];
+  }
+  const ai = includeAi ? await synthesize({
+    symbol,
+    interval,
+    currentPrice,
+    regime: { hurst: h, regimeLabel: reg.label, garchRegime: garchLabel },
+    zones,
+    signals: signals.map((s) => ({ name: s.name, value: s.value, label: s.label })),
+    crossPair
+  }) : null;
+  return {
+    symbol,
+    interval,
+    currentPrice,
+    regime,
+    levels: rawLevels.map((l) => ({
+      price: l.price,
+      method: l.method,
+      kind: l.kind,
+      strength: l.strength,
+      validated: l.validated,
+      bounceRate: l.bounceRate,
+      pValue: l.pValue,
+      touches: l.touches,
+      lastTouchAge: Number.isFinite(l.lastTouchAge) ? l.lastTouchAge : null,
+      isStale: l.isStale
+    })),
+    zones,
+    signals,
+    divergences,
+    kde: kdePoints,
+    liquidations,
+    ai,
+    generatedAt: Date.now()
+  };
+}
+
+// src/schemas.ts
+import { z } from "zod";
+var SUPPORTED_INTERVALS = [
+  "1m",
+  "3m",
+  "5m",
+  "15m",
+  "30m",
+  "1h",
+  "2h",
+  "4h",
+  "8h",
+  "12h",
+  "1d",
+  "3d",
+  "1w"
+];
+var OVERLAP_STRENGTH_TIERS = ["developing", "strong", "elite"];
+var intervalSchema = z.coerce.string().trim().refine(
+  (value) => SUPPORTED_INTERVALS.includes(value),
+  { message: `Unsupported interval. Supported intervals: ${SUPPORTED_INTERVALS.join(", ")}` }
+);
+var symbolSchema = z.coerce.string().trim().min(1, "symbol is required").max(32, "symbol is too long").regex(/^[A-Za-z0-9:_./-]+$/, "symbol contains unsupported characters").transform((value) => value.toUpperCase());
+var booleanQuerySchema = z.preprocess((value) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return value;
+  const normalized = value.trim().toLowerCase();
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  return value;
+}, z.boolean());
+var GetLevelsQueryParams = z.object({
+  symbol: symbolSchema,
+  interval: intervalSchema
+});
+var GetAllSourceOverlapQueryParams = GetLevelsQueryParams.extend({
+  minStrength: z.enum(OVERLAP_STRENGTH_TIERS).optional().default("developing"),
+  limit: z.coerce.number().int().min(1).max(80).optional().default(20),
+  includeLive: booleanQuerySchema.optional().default(true),
+  liveBudgetMs: z.coerce.number().int().min(50).max(2e3).optional().default(450)
+});
+var GetLevelsResponse = z.object({
+  symbol: z.string(),
+  interval: z.string(),
+  currentPrice: z.number(),
+  regime: z.object({
+    symbol: z.string(),
+    interval: z.string(),
+    hurst: z.number(),
+    regimeLabel: z.string().describe("mean-reverting | random | trending"),
+    signalWeightMultiplier: z.number(),
+    garchVolatility: z.number(),
+    garchRegime: z.string().describe("low | normal | high")
+  }),
+  levels: z.array(
+    z.object({
+      price: z.number(),
+      method: z.string(),
+      kind: z.string().describe("support | resistance | neutral"),
+      strength: z.number(),
+      validated: z.boolean(),
+      bounceRate: z.number().nullish(),
+      pValue: z.number().nullish(),
+      touches: z.number().nullish(),
+      lastTouchAge: z.number().nullable().optional(),
+      isStale: z.boolean().optional()
+    })
+  ),
+  zones: z.array(
+    z.object({
+      priceLow: z.number(),
+      priceHigh: z.number(),
+      score: z.number(),
+      kind: z.string(),
+      methods: z.array(z.string()),
+      preciseEntryPrice: z.number(),
+      entryMethod: z.string(),
+      bounceRate: z.number().nullish(),
+      pValue: z.number().nullish(),
+      posteriorBounceRate: z.number().nullish(),
+      confirmed: z.boolean(),
+      confirmingTimeframe: z.string().nullish(),
+      crossAssetConfirmed: z.boolean(),
+      confidence: z.string()
+    })
+  ),
+  signals: z.array(z.object({ name: z.string(), value: z.number(), label: z.string(), direction: z.string() })),
+  divergences: z.array(z.object({ time: z.number(), price: z.number(), kind: z.string(), magnitude: z.number() })).optional(),
+  kde: z.array(z.object({ price: z.number(), density: z.number() })),
+  liquidations: z.array(z.object({ price: z.number(), density: z.number(), leverage: z.number() })).optional(),
+  ai: z.object({
+    summary: z.string(),
+    confidence: z.string(),
+    recommendedEntry: z.number().nullable(),
+    direction: z.string(),
+    reasoning: z.array(z.string()),
+    consistency: z.string()
+  }).nullable().optional(),
+  generatedAt: z.number()
+});
+export {
+  ALL_SOURCE_OVERLAP_CHECKED_METHODS,
+  GetAllSourceOverlapQueryParams,
+  GetLevelsQueryParams,
+  GetLevelsResponse,
+  OVERLAP_STRENGTH_TIERS,
+  SUPPORTED_INTERVALS,
+  TtlCache,
+  clearAllLevelsRefresh,
+  computeAllSourceOverlapData,
+  computeLevelsData,
+  computeMarketProfileData,
+  computeRegimeData,
+  confluence_exports as confluence,
+  crosspair_exports as crosspair,
+  etagFor,
+  getCachedAllSourceOverlap,
+  getCachedConfluenceOverlay,
+  getCachedLevels,
+  getCachedLevelsOverlay,
+  getCachedLevelsStale,
+  getCachedMarketProfile,
+  getCachedRegime,
+  hyperliquid_exports as hyperliquid,
+  levels_exports as levels,
+  orderflow_exports as orderflow,
+  precision_exports as precision,
+  prewarmAllSourceOverlap,
+  prewarmConfluenceOverlay,
+  quantile_exports as quantile,
+  regime_exports as regime,
+  reliability_exports as reliability,
+  scheduleAllSourceOverlapRefresh,
+  scheduleConfluenceOverlayRefresh,
+  scheduleLevelsRefresh,
+  sendCached,
+  stopAllSourceOverlapRefresh,
+  stopConfluenceOverlayRefresh,
+  stopLevelsRefresh,
+  synthesize
+};
+//# sourceMappingURL=index.js.map
