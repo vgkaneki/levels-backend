@@ -2332,4 +2332,8 @@ export {
   scheduleLevelsRefresh,
   sendCached,
   stopAllSourceOverlapRefresh,
-  stopConfluenceOverlayRefre
+  stopConfluenceOverlayRefresh,
+  stopLevelsRefresh,
+  synthesize
+};
+//# sourceMappingURL=index.js.map
