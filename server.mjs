@@ -51,6 +51,62 @@ function runtimeErrorStatus(err) {
   return msg.includes("symbol is required") || msg.includes("Unsupported interval") ? 400 : 502;
 }
 
+const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
+
+const CANDLE_INTERVAL_MS = {
+  "1m": 60_000,
+  "3m": 3 * 60_000,
+  "5m": 5 * 60_000,
+  "15m": 15 * 60_000,
+  "30m": 30 * 60_000,
+  "1h": 60 * 60_000,
+  "2h": 2 * 60 * 60_000,
+  "4h": 4 * 60 * 60_000,
+  "8h": 8 * 60 * 60_000,
+  "12h": 12 * 60 * 60_000,
+  "1d": 24 * 60 * 60_000,
+  "3d": 3 * 24 * 60 * 60_000,
+  "1w": 7 * 24 * 60 * 60_000,
+};
+
+function normalizeCandleSymbol(symbol) {
+  return String(symbol || "").trim().toUpperCase();
+}
+
+function normalizeCandleInterval(interval) {
+  const raw = String(interval || "4h").trim();
+  if (Object.prototype.hasOwnProperty.call(CANDLE_INTERVAL_MS, raw)) return raw;
+  const lower = raw.toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(CANDLE_INTERVAL_MS, lower)) return lower;
+  return raw;
+}
+
+function parseCandleLimit(raw) {
+  const n = Number(raw ?? 500);
+  if (!Number.isFinite(n) || n <= 0) return 500;
+  return Math.max(1, Math.min(5000, Math.floor(n)));
+}
+
+function normalizeHyperliquidCandle(c) {
+  const time = Number(c.t ?? c.time ?? c.timestamp);
+  const open = Number(c.o ?? c.open);
+  const high = Number(c.h ?? c.high);
+  const low = Number(c.l ?? c.low);
+  const close = Number(c.c ?? c.close);
+  const volume = Number(c.v ?? c.volume ?? 0);
+
+  if (![time, open, high, low, close].every(Number.isFinite)) return null;
+
+  return {
+    time,
+    open,
+    high,
+    low,
+    close,
+    volume: Number.isFinite(volume) ? volume : 0,
+  };
+}
+
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
@@ -59,6 +115,7 @@ app.get("/", (_req, res) => {
     endpoints: [
       "/api/health",
       "/api/engine-check",
+      "/api/market-data/candles?symbol=BTC&interval=4h&limit=20",
       "/api/levels/all-source-overlap?symbol=BTC&interval=4h&minStrength=strong&limit=20&includeLive=true",
       "/api/levels/confluence-overlay?symbol=BTC&interval=4h&minStrength=strong&limit=20&includeLive=true",
       "/api/levels/prewarm?symbol=BTC&interval=4h&minStrength=strong&limit=20&includeLive=true",
@@ -70,7 +127,7 @@ app.get("/", (_req, res) => {
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    build: "v1.4-backend-host-render-safe-v2",
+    build: "v1.4-backend-host-render-safe-v3-candles",
     time: new Date().toISOString(),
   });
 });
@@ -90,6 +147,83 @@ app.get("/api/engine-check", async (_req, res) => {
       engineLoaded: false,
       error: errorPayload(err),
       hint: "The backend server is running, but exported-levels-engine/dist/index.js failed to import. The engine file may be incomplete or malformed.",
+    });
+  }
+});
+
+app.get("/api/market-data/candles", async (req, res) => {
+  const symbol = normalizeCandleSymbol(req.query.symbol);
+  const interval = normalizeCandleInterval(req.query.interval);
+  const limit = parseCandleLimit(req.query.limit);
+
+  if (!symbol) {
+    validationError(res, "symbol is required");
+    return;
+  }
+
+  const stepMs = CANDLE_INTERVAL_MS[interval];
+  if (!stepMs) {
+    validationError(res, `Unsupported interval: ${interval}. Supported intervals: ${Object.keys(CANDLE_INTERVAL_MS).join(", ")}`);
+    return;
+  }
+
+  const endTime = Date.now();
+  const startTime = endTime - stepMs * limit;
+
+  try {
+    const hlRes = await fetch(HL_INFO_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "candleSnapshot",
+        req: {
+          coin: symbol,
+          interval,
+          startTime,
+          endTime,
+        },
+      }),
+    });
+
+    if (!hlRes.ok) {
+      const detail = await hlRes.text().catch(() => "");
+      res.status(502).json({
+        ok: false,
+        error: "Failed to fetch candles from Hyperliquid",
+        detail,
+      });
+      return;
+    }
+
+    const raw = await hlRes.json();
+    if (!Array.isArray(raw)) {
+      res.status(502).json({
+        ok: false,
+        error: "Unexpected Hyperliquid candle response shape",
+        detail: typeof raw === "object" ? JSON.stringify(raw).slice(0, 500) : String(raw),
+      });
+      return;
+    }
+
+    const candles = raw
+      .map(normalizeHyperliquidCandle)
+      .filter(Boolean)
+      .sort((a, b) => a.time - b.time);
+
+    res.setHeader("Cache-Control", "public, max-age=5, stale-while-revalidate=30");
+    res.json({
+      ok: true,
+      symbol,
+      interval,
+      source: "hyperliquid",
+      candles,
+    });
+  } catch (err) {
+    res.status(502).json({
+      ok: false,
+      error: "Failed to fetch candles",
+      detail: errorMessage(err),
+      raw: errorPayload(err),
     });
   }
 });
