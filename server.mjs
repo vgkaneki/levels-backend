@@ -1,4 +1,5 @@
 import express from "express";
+import WebSocket from "ws";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -52,6 +53,7 @@ function runtimeErrorStatus(err) {
 }
 
 const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
+const HL_WS_URL = "wss://api.hyperliquid.xyz/ws";
 
 const CANDLE_INTERVAL_MS = {
   "1m": 60_000,
@@ -88,12 +90,12 @@ function parseCandleLimit(raw) {
 }
 
 function normalizeHyperliquidCandle(c) {
-  const time = Number(c.t ?? c.time ?? c.timestamp);
-  const open = Number(c.o ?? c.open);
-  const high = Number(c.h ?? c.high);
-  const low = Number(c.l ?? c.low);
-  const close = Number(c.c ?? c.close);
-  const volume = Number(c.v ?? c.volume ?? 0);
+  const time = Number(c?.t ?? c?.time ?? c?.timestamp);
+  const open = Number(c?.o ?? c?.open);
+  const high = Number(c?.h ?? c?.high);
+  const low = Number(c?.l ?? c?.low);
+  const close = Number(c?.c ?? c?.close);
+  const volume = Number(c?.v ?? c?.volume ?? 0);
 
   if (![time, open, high, low, close].every(Number.isFinite)) return null;
 
@@ -107,6 +109,17 @@ function normalizeHyperliquidCandle(c) {
   };
 }
 
+function sseWrite(res, event, data) {
+  if (res.destroyed || res.writableEnded) return;
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function extractLiveCandle(payload) {
+  const raw = payload?.data?.candle ?? payload?.data ?? payload?.candle ?? payload;
+  return normalizeHyperliquidCandle(raw);
+}
+
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
@@ -116,6 +129,7 @@ app.get("/", (_req, res) => {
       "/api/health",
       "/api/engine-check",
       "/api/market-data/candles?symbol=BTC&interval=4h&limit=20",
+      "/api/market-data/candles/live?symbol=BTC&interval=1h",
       "/api/levels/all-source-overlap?symbol=BTC&interval=4h&minStrength=strong&limit=20&includeLive=true",
       "/api/levels/confluence-overlay?symbol=BTC&interval=4h&minStrength=strong&limit=20&includeLive=true",
       "/api/levels/prewarm?symbol=BTC&interval=4h&minStrength=strong&limit=20&includeLive=true",
@@ -127,7 +141,7 @@ app.get("/", (_req, res) => {
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    build: "v1.4-backend-host-render-safe-v3-candles",
+    build: "v1.5-backend-host-render-safe-live-candles",
     time: new Date().toISOString(),
   });
 });
@@ -216,6 +230,7 @@ app.get("/api/market-data/candles", async (req, res) => {
       symbol,
       interval,
       source: "hyperliquid",
+      mode: "snapshot",
       candles,
     });
   } catch (err) {
@@ -226,6 +241,121 @@ app.get("/api/market-data/candles", async (req, res) => {
       raw: errorPayload(err),
     });
   }
+});
+
+app.get("/api/market-data/candles/live", (req, res) => {
+  const symbol = normalizeCandleSymbol(req.query.symbol);
+  const interval = normalizeCandleInterval(req.query.interval);
+
+  if (!symbol) {
+    validationError(res, "symbol is required");
+    return;
+  }
+
+  if (!CANDLE_INTERVAL_MS[interval]) {
+    validationError(res, `Unsupported interval: ${interval}. Supported intervals: ${Object.keys(CANDLE_INTERVAL_MS).join(", ")}`);
+    return;
+  }
+
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  sseWrite(res, "status", {
+    ok: true,
+    source: "hyperliquid",
+    mode: "live-candle-stream",
+    symbol,
+    interval,
+    connectedAt: Date.now(),
+  });
+
+  const ws = new WebSocket(HL_WS_URL, {
+    perMessageDeflate: false,
+    handshakeTimeout: 10_000,
+  });
+
+  let closed = false;
+  let lastCandleAt = 0;
+
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    try {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(1000, "client closed");
+      }
+    } catch {
+      // Ignore socket close failures.
+    }
+  };
+
+  const heartbeat = setInterval(() => {
+    if (closed || res.destroyed || res.writableEnded) {
+      cleanup();
+      return;
+    }
+    sseWrite(res, "heartbeat", { ok: true, symbol, interval, now: Date.now(), lastCandleAt });
+  }, 15_000);
+
+  ws.on("open", () => {
+    try {
+      ws.send(JSON.stringify({
+        method: "subscribe",
+        subscription: {
+          type: "candle",
+          coin: symbol,
+          interval,
+        },
+      }));
+      sseWrite(res, "status", { ok: true, connected: true, subscribed: true, symbol, interval, now: Date.now() });
+    } catch (err) {
+      sseWrite(res, "error", { ok: false, error: "Failed to subscribe Hyperliquid candle stream", detail: errorMessage(err) });
+    }
+  });
+
+  ws.on("message", (data) => {
+    if (closed || res.destroyed || res.writableEnded) return;
+    try {
+      const payload = JSON.parse(String(data));
+      if (payload?.channel && payload.channel !== "candle") return;
+      const candle = extractLiveCandle(payload);
+      if (!candle) return;
+      lastCandleAt = Date.now();
+      sseWrite(res, "candle", {
+        ok: true,
+        symbol,
+        interval,
+        source: "hyperliquid-ws",
+        receivedAt: lastCandleAt,
+        candle,
+      });
+    } catch (err) {
+      sseWrite(res, "error", { ok: false, error: "Failed to parse Hyperliquid candle stream message", detail: errorMessage(err) });
+    }
+  });
+
+  ws.on("error", (err) => {
+    if (closed || res.destroyed || res.writableEnded) return;
+    sseWrite(res, "error", { ok: false, error: "Hyperliquid candle WebSocket error", detail: errorMessage(err) });
+  });
+
+  ws.on("close", (code, reason) => {
+    if (closed || res.destroyed || res.writableEnded) return;
+    sseWrite(res, "status", { ok: false, connected: false, closed: true, code, reason: String(reason || ""), now: Date.now() });
+    cleanup();
+    try {
+      res.end();
+    } catch {
+      // Ignore end failures.
+    }
+  });
+
+  req.on("close", cleanup);
 });
 
 app.get("/api/levels", async (req, res) => {
