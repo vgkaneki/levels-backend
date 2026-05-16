@@ -71,8 +71,14 @@ const CANDLE_INTERVAL_MS = {
   "1w": 7 * 24 * 60 * 60_000,
 };
 
+const FETCH_TIMEOUT_MS = 12_000;
+const LIVE_HEARTBEAT_MS = 15_000;
+const LIVE_IDLE_CLOSE_MS = 12_000;
+const LIVE_STALE_RECONNECT_MS = 90_000;
+const LIVE_MAX_BACKOFF_MS = 30_000;
+
 function normalizeCandleSymbol(symbol) {
-  return String(symbol || "").trim().toUpperCase();
+  return String(symbol || "").trim();
 }
 
 function normalizeCandleInterval(interval) {
@@ -89,8 +95,14 @@ function parseCandleLimit(raw) {
   return Math.max(1, Math.min(5000, Math.floor(n)));
 }
 
+function normalizeTimeMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return NaN;
+  return n > 1e11 ? Math.floor(n) : Math.floor(n * 1000);
+}
+
 function normalizeHyperliquidCandle(c) {
-  const time = Number(c?.t ?? c?.time ?? c?.timestamp);
+  const time = normalizeTimeMs(c?.t ?? c?.time ?? c?.timestamp ?? c?.T);
   const open = Number(c?.o ?? c?.open);
   const high = Number(c?.h ?? c?.high);
   const low = Number(c?.l ?? c?.low);
@@ -110,14 +122,335 @@ function normalizeHyperliquidCandle(c) {
 }
 
 function sseWrite(res, event, data) {
-  if (res.destroyed || res.writableEnded) return;
+  if (res.destroyed || res.writableEnded) return false;
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+  return true;
 }
 
 function extractLiveCandle(payload) {
   const raw = payload?.data?.candle ?? payload?.data ?? payload?.candle ?? payload;
   return normalizeHyperliquidCandle(raw);
+}
+
+async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function liveRoomKey(symbol, interval) {
+  return `${symbol}|${interval}`;
+}
+
+const liveRooms = new Map();
+
+function createLiveRoom(symbol, interval) {
+  return {
+    key: liveRoomKey(symbol, interval),
+    symbol,
+    interval,
+    clients: new Set(),
+    ws: null,
+    status: "idle",
+    startedAt: Date.now(),
+    lastAnyMessageAt: 0,
+    lastCandleAt: 0,
+    latestCandle: null,
+    reconnectAttempts: 0,
+    reconnectTimer: null,
+    heartbeatTimer: null,
+    staleTimer: null,
+    idleCloseTimer: null,
+    closeRequested: false,
+  };
+}
+
+function getLiveRoom(symbol, interval) {
+  const key = liveRoomKey(symbol, interval);
+  let room = liveRooms.get(key);
+  if (!room) {
+    room = createLiveRoom(symbol, interval);
+    liveRooms.set(key, room);
+  }
+  return room;
+}
+
+function broadcastRoom(room, event, data) {
+  for (const client of [...room.clients]) {
+    if (!client.res || client.res.destroyed || client.res.writableEnded) {
+      room.clients.delete(client);
+      continue;
+    }
+    sseWrite(client.res, event, data);
+  }
+}
+
+function setRoomStatus(room, status, extra = {}) {
+  room.status = status;
+  broadcastRoom(room, "status", {
+    ok: status !== "error",
+    source: "hyperliquid",
+    mode: "shared-live-candle-stream",
+    symbol: room.symbol,
+    interval: room.interval,
+    status,
+    clients: room.clients.size,
+    lastCandleAt: room.lastCandleAt || null,
+    now: Date.now(),
+    ...extra,
+  });
+}
+
+function clearRoomTimers(room) {
+  clearTimeout(room.reconnectTimer);
+  clearInterval(room.heartbeatTimer);
+  clearInterval(room.staleTimer);
+  clearTimeout(room.idleCloseTimer);
+  room.reconnectTimer = null;
+  room.heartbeatTimer = null;
+  room.staleTimer = null;
+  room.idleCloseTimer = null;
+}
+
+function stopLiveRoom(room, reason = "stopped") {
+  room.closeRequested = true;
+  clearRoomTimers(room);
+  try {
+    if (room.ws && (room.ws.readyState === WebSocket.OPEN || room.ws.readyState === WebSocket.CONNECTING)) {
+      room.ws.close(1000, reason);
+    }
+  } catch {
+    // Ignore socket close failures.
+  }
+  room.ws = null;
+  room.status = "idle";
+}
+
+function scheduleLiveReconnect(room, reason = "reconnect") {
+  if (room.closeRequested || room.clients.size === 0) return;
+  clearTimeout(room.reconnectTimer);
+  const backoff = Math.min(LIVE_MAX_BACKOFF_MS, 1_000 * 2 ** Math.min(room.reconnectAttempts, 5));
+  const jitter = Math.floor(Math.random() * 800);
+  const delay = backoff + jitter;
+  room.reconnectAttempts += 1;
+  setRoomStatus(room, "connecting", { reconnecting: true, reason, retryInMs: delay });
+  room.reconnectTimer = setTimeout(() => {
+    room.reconnectTimer = null;
+    startLiveRoom(room);
+  }, delay);
+  room.reconnectTimer.unref?.();
+}
+
+function startRoomHeartbeat(room) {
+  clearInterval(room.heartbeatTimer);
+  clearInterval(room.staleTimer);
+
+  room.heartbeatTimer = setInterval(() => {
+    if (room.clients.size === 0) return;
+    if (room.ws?.readyState === WebSocket.OPEN) {
+      try {
+        room.ws.ping?.();
+      } catch {
+        // Ignore ping errors; stale watchdog will reconnect if needed.
+      }
+    }
+    broadcastRoom(room, "heartbeat", {
+      ok: true,
+      symbol: room.symbol,
+      interval: room.interval,
+      status: room.status,
+      clients: room.clients.size,
+      now: Date.now(),
+      lastCandleAt: room.lastCandleAt || null,
+      lastAnyMessageAt: room.lastAnyMessageAt || null,
+    });
+  }, LIVE_HEARTBEAT_MS);
+  room.heartbeatTimer.unref?.();
+
+  room.staleTimer = setInterval(() => {
+    if (room.clients.size === 0 || room.status === "idle") return;
+    const last = room.lastAnyMessageAt || room.startedAt;
+    const age = Date.now() - last;
+    if (age > LIVE_STALE_RECONNECT_MS) {
+      broadcastRoom(room, "status", {
+        ok: false,
+        source: "hyperliquid",
+        mode: "shared-live-candle-stream",
+        symbol: room.symbol,
+        interval: room.interval,
+        status: "stale",
+        ageMs: age,
+        now: Date.now(),
+      });
+      try {
+        room.ws?.terminate?.();
+      } catch {
+        // Ignore termination failures.
+      }
+      room.ws = null;
+      scheduleLiveReconnect(room, "stale stream");
+    }
+  }, Math.max(20_000, Math.floor(LIVE_STALE_RECONNECT_MS / 3)));
+  room.staleTimer.unref?.();
+}
+
+function startLiveRoom(room) {
+  if (room.closeRequested) room.closeRequested = false;
+  if (room.clients.size === 0) return;
+  if (room.ws && (room.ws.readyState === WebSocket.OPEN || room.ws.readyState === WebSocket.CONNECTING)) return;
+
+  room.startedAt = Date.now();
+  room.lastAnyMessageAt = Date.now();
+  setRoomStatus(room, "connecting");
+  startRoomHeartbeat(room);
+
+  const ws = new WebSocket(HL_WS_URL, {
+    perMessageDeflate: false,
+    handshakeTimeout: 10_000,
+  });
+  room.ws = ws;
+
+  ws.on("open", () => {
+    if (room.ws !== ws || room.closeRequested) return;
+    room.reconnectAttempts = 0;
+    room.lastAnyMessageAt = Date.now();
+    try {
+      ws.send(JSON.stringify({
+        method: "subscribe",
+        subscription: {
+          type: "candle",
+          coin: room.symbol,
+          interval: room.interval,
+        },
+      }));
+      setRoomStatus(room, "live", { connected: true, subscribed: true });
+      if (room.latestCandle) {
+        broadcastRoom(room, "candle", {
+          ok: true,
+          symbol: room.symbol,
+          interval: room.interval,
+          source: "backend-cache",
+          receivedAt: Date.now(),
+          candle: room.latestCandle,
+        });
+      }
+    } catch (err) {
+      broadcastRoom(room, "error", { ok: false, error: "Failed to subscribe Hyperliquid candle stream", detail: errorMessage(err) });
+      scheduleLiveReconnect(room, "subscribe failed");
+    }
+  });
+
+  ws.on("message", (data) => {
+    if (room.ws !== ws || room.closeRequested) return;
+    room.lastAnyMessageAt = Date.now();
+    try {
+      const payload = JSON.parse(String(data));
+      if (payload?.channel && payload.channel !== "candle") return;
+      const candle = extractLiveCandle(payload);
+      if (!candle) return;
+      room.lastCandleAt = Date.now();
+      room.latestCandle = candle;
+      room.status = "live";
+      broadcastRoom(room, "candle", {
+        ok: true,
+        symbol: room.symbol,
+        interval: room.interval,
+        source: "hyperliquid-ws",
+        receivedAt: room.lastCandleAt,
+        candle,
+      });
+    } catch (err) {
+      broadcastRoom(room, "error", { ok: false, error: "Failed to parse Hyperliquid candle stream message", detail: errorMessage(err) });
+    }
+  });
+
+  ws.on("pong", () => {
+    if (room.ws === ws) room.lastAnyMessageAt = Date.now();
+  });
+
+  ws.on("error", (err) => {
+    if (room.ws !== ws || room.closeRequested) return;
+    setRoomStatus(room, "error", { error: "Hyperliquid candle WebSocket error", detail: errorMessage(err) });
+  });
+
+  ws.on("close", (code, reason) => {
+    if (room.ws === ws) room.ws = null;
+    if (room.closeRequested || room.clients.size === 0) return;
+    setRoomStatus(room, "connecting", { connected: false, closed: true, code, reason: String(reason || "") });
+    scheduleLiveReconnect(room, `ws close ${code}`);
+  });
+}
+
+function addLiveClient(room, req, res) {
+  clearTimeout(room.idleCloseTimer);
+  const client = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, res };
+  room.clients.add(client);
+
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+  res.write("retry: 2500\n\n");
+
+  sseWrite(res, "status", {
+    ok: true,
+    source: "hyperliquid",
+    mode: "shared-live-candle-stream",
+    symbol: room.symbol,
+    interval: room.interval,
+    status: room.status,
+    clients: room.clients.size,
+    connectedAt: Date.now(),
+    lastCandleAt: room.lastCandleAt || null,
+  });
+
+  if (room.latestCandle) {
+    sseWrite(res, "candle", {
+      ok: true,
+      symbol: room.symbol,
+      interval: room.interval,
+      source: "backend-cache",
+      receivedAt: Date.now(),
+      candle: room.latestCandle,
+    });
+  }
+
+  startLiveRoom(room);
+
+  const cleanup = () => {
+    room.clients.delete(client);
+    if (room.clients.size === 0) {
+      clearTimeout(room.idleCloseTimer);
+      room.idleCloseTimer = setTimeout(() => {
+        if (room.clients.size === 0) {
+          stopLiveRoom(room, "idle");
+          liveRooms.delete(room.key);
+        }
+      }, LIVE_IDLE_CLOSE_MS);
+      room.idleCloseTimer.unref?.();
+    } else {
+      broadcastRoom(room, "status", {
+        ok: true,
+        source: "hyperliquid",
+        mode: "shared-live-candle-stream",
+        symbol: room.symbol,
+        interval: room.interval,
+        status: room.status,
+        clients: room.clients.size,
+        now: Date.now(),
+      });
+    }
+  };
+
+  req.on("close", cleanup);
+  res.on("close", cleanup);
 }
 
 app.get("/", (_req, res) => {
@@ -141,7 +474,8 @@ app.get("/", (_req, res) => {
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    build: "v1.5-backend-host-render-safe-live-candles",
+    build: "v1.6-backend-host-shared-live-candles",
+    liveRooms: liveRooms.size,
     time: new Date().toISOString(),
   });
 });
@@ -185,7 +519,7 @@ app.get("/api/market-data/candles", async (req, res) => {
   const startTime = endTime - stepMs * limit;
 
   try {
-    const hlRes = await fetch(HL_INFO_URL, {
+    const hlRes = await fetchWithTimeout(HL_INFO_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -257,105 +591,8 @@ app.get("/api/market-data/candles/live", (req, res) => {
     return;
   }
 
-  res.status(200);
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders?.();
-
-  sseWrite(res, "status", {
-    ok: true,
-    source: "hyperliquid",
-    mode: "live-candle-stream",
-    symbol,
-    interval,
-    connectedAt: Date.now(),
-  });
-
-  const ws = new WebSocket(HL_WS_URL, {
-    perMessageDeflate: false,
-    handshakeTimeout: 10_000,
-  });
-
-  let closed = false;
-  let lastCandleAt = 0;
-
-  const cleanup = () => {
-    if (closed) return;
-    closed = true;
-    clearInterval(heartbeat);
-    try {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close(1000, "client closed");
-      }
-    } catch {
-      // Ignore socket close failures.
-    }
-  };
-
-  const heartbeat = setInterval(() => {
-    if (closed || res.destroyed || res.writableEnded) {
-      cleanup();
-      return;
-    }
-    sseWrite(res, "heartbeat", { ok: true, symbol, interval, now: Date.now(), lastCandleAt });
-  }, 15_000);
-
-  ws.on("open", () => {
-    try {
-      ws.send(JSON.stringify({
-        method: "subscribe",
-        subscription: {
-          type: "candle",
-          coin: symbol,
-          interval,
-        },
-      }));
-      sseWrite(res, "status", { ok: true, connected: true, subscribed: true, symbol, interval, now: Date.now() });
-    } catch (err) {
-      sseWrite(res, "error", { ok: false, error: "Failed to subscribe Hyperliquid candle stream", detail: errorMessage(err) });
-    }
-  });
-
-  ws.on("message", (data) => {
-    if (closed || res.destroyed || res.writableEnded) return;
-    try {
-      const payload = JSON.parse(String(data));
-      if (payload?.channel && payload.channel !== "candle") return;
-      const candle = extractLiveCandle(payload);
-      if (!candle) return;
-      lastCandleAt = Date.now();
-      sseWrite(res, "candle", {
-        ok: true,
-        symbol,
-        interval,
-        source: "hyperliquid-ws",
-        receivedAt: lastCandleAt,
-        candle,
-      });
-    } catch (err) {
-      sseWrite(res, "error", { ok: false, error: "Failed to parse Hyperliquid candle stream message", detail: errorMessage(err) });
-    }
-  });
-
-  ws.on("error", (err) => {
-    if (closed || res.destroyed || res.writableEnded) return;
-    sseWrite(res, "error", { ok: false, error: "Hyperliquid candle WebSocket error", detail: errorMessage(err) });
-  });
-
-  ws.on("close", (code, reason) => {
-    if (closed || res.destroyed || res.writableEnded) return;
-    sseWrite(res, "status", { ok: false, connected: false, closed: true, code, reason: String(reason || ""), now: Date.now() });
-    cleanup();
-    try {
-      res.end();
-    } catch {
-      // Ignore end failures.
-    }
-  });
-
-  req.on("close", cleanup);
+  const room = getLiveRoom(symbol, interval);
+  addLiveClient(room, req, res);
 });
 
 app.get("/api/levels", async (req, res) => {
@@ -474,5 +711,5 @@ app.use((req, res) => {
 });
 
 app.listen(port, "0.0.0.0", () => {
-  console.log(`levels-engine-v1.4 backend listening on port ${port}`);
+  console.log(`levels-engine-v1.6 backend listening on port ${port}`);
 });
